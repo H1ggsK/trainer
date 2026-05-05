@@ -19,7 +19,8 @@ if enabled(os.environ.get("TRAINER_PASSWORD_RANDOM_EACH_START", "1")):
     print(" Clicker Trainer admin login", flush=True)
     print(f" Username: {os.environ.get('TRAINER_USERNAME', 'trainer')}", flush=True)
     print(f" Password: {password}", flush=True)
-    print(" URL:      http://localhost:9000/admin", flush=True)
+    public_url = os.environ.get("TRAINER_PUBLIC_URL", "http://localhost:8000").rstrip("/")
+    print(f" URL:      {public_url}/admin", flush=True)
     print("========================================", flush=True)
     print("", flush=True)
 

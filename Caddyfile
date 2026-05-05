@@ -1,6 +1,6 @@
-# Caddy is the only service that publishes host port 9000.
-# It proxies to the trainer app on the private Docker network.
+# This app stays on localhost:9000 so your main Caddy can own public 80/443.
+# In the main Caddyfile, proxy training.catfacts.cc to http://host.docker.internal:9000.
 :80 {
-    encode gzip zstd
-    reverse_proxy trainer:8000
+	encode gzip zstd
+	reverse_proxy trainer:8000
 }

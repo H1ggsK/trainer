@@ -9,6 +9,7 @@ services:
       TRAINER_USERNAME: "${TRAINER_USERNAME:-trainer}"
       TRAINER_PASSWORD_RANDOM_EACH_START: "${TRAINER_PASSWORD_RANDOM_EACH_START:-1}"
       SESSION_SECRET: "${SESSION_SECRET:-change-this-too}"
+      TRAINER_PUBLIC_URL: "${TRAINER_PUBLIC_URL:-https://training.catfacts.cc}"
       TRAINER_DB_PATH: /data/trainer.sqlite3
       TRAINER_AUDIO_DIR: /data/audio
     volumes:
@@ -21,8 +22,7 @@ services:
     depends_on:
       - trainer
     ports:
-      - "9000:80"
-      - "9443:443"
+      - "127.0.0.1:9000:80"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

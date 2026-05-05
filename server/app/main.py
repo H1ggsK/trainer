@@ -1230,6 +1230,30 @@ function render(payload) {
   renderLogs();
 }
 
+async function copyTextFromInput(input) {
+  const text = input.value;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (error) {
+    console.warn('Clipboard API failed, trying fallback', error);
+  }
+  input.focus();
+  input.select();
+  input.setSelectionRange(0, text.length);
+  try {
+    const copied = document.execCommand('copy');
+    input.blur();
+    return copied;
+  } catch (error) {
+    console.warn('Fallback copy failed', error);
+    input.blur();
+    return false;
+  }
+}
+
 window.selectPet = (id) => { selectedPetId = id; clearLiveCanvas(); render({state, logs}); };
 window.changeCode = async (id) => {
   const code = prompt('New code');
@@ -1245,7 +1269,7 @@ $('stayOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled
 $('stayOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled: false}, e.target);
 $('randomOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/random-click`, {enabled: true, min_seconds: Number($('clickMin').value || 30), max_seconds: Number($('clickMax').value || 300)}, e.target);
 $('randomOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/random-click`, {enabled: false, min_seconds: Number($('clickMin').value || 30), max_seconds: Number($('clickMax').value || 300)}, e.target);
-$('copyLink').onclick = async () => { await navigator.clipboard.writeText($('petLink').value); showToast('Copied'); };
+$('copyLink').onclick = async () => { showToast(await copyTextFromInput($('petLink')) ? 'Copied' : 'Copy failed'); };
 $('logout').onclick = async () => { await fetch('/api/logout', {method: 'POST'}); location.href = '/'; };
 
 function connectTrainerWs() {

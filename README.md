@@ -47,7 +47,24 @@ For Docker Compose:
 docker compose up --build
 ```
 
-With the included compose file, open `http://localhost:9000`. Compose reads local secrets from `.env`, which is gitignored. After first boot you can add/remove pet codes and trainer accounts from the trainer panel.
+With the included compose file, the app listens on `http://127.0.0.1:9000`. On your VPS, put your existing HTTPS service in front of it and proxy `https://training.catfacts.cc` to `http://127.0.0.1:9000`. Compose reads local secrets from `.env`, which is gitignored. After first boot you can add/remove pet codes and trainer accounts from the trainer panel.
+
+Browsers require HTTPS for camera access unless the page is on `localhost`, so use the HTTPS front door for real pet clients.
+
+For your existing CatFacts Caddy container, add this to its Caddyfile:
+
+```caddy
+training.catfacts.cc {
+	reverse_proxy host.docker.internal:9000
+}
+```
+
+On Linux, that Caddy container also needs this under its `caddy:` service:
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
 
 When `TRAINER_PASSWORD_RANDOM_EACH_START=1`, Docker prints a fresh admin password every container start and resets the admin account to that password. See it with:
 
