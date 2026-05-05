@@ -14,7 +14,7 @@ Server and browser client both advertise `PROTOCOL_VERSION = "1.0.0"`. They must
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r server/requirements.txt
-TRAINER_PASSWORD='change-this' INITIAL_PET_CODE='pet-code' uvicorn server.app.main:app --host 0.0.0.0 --port 8000
+TRAINER_PASSWORD='change-this' uvicorn server.app.main:app --host 0.0.0.0 --port 8000
 ```
 
 Then open `http://YOUR_VPS_IP:8000`.
@@ -24,15 +24,17 @@ For the pet link on a real VPS, put the server behind HTTPS. Browsers usually bl
 Default login:
 
 - username: `trainer`
-- password: value of `TRAINER_PASSWORD`, or `trainer` if unset
+- Docker/Compose password: printed in the container logs at startup
+- local non-Docker password: value of `TRAINER_PASSWORD`, or `trainer` if unset
+
+The first account is an admin account. Admins manage trainer accounts at `/admin` and cannot access pet controls or pet logs. Create a separate trainer account from `/admin`, log out, then log in with that trainer account to use the training panel at `/`.
 
 For Docker:
 
 ```bash
 docker build -f server/Dockerfile -t clicker-trainer-server .
 docker run --rm -p 8000:8000 \
-  -e TRAINER_PASSWORD='change-this' \
-  -e INITIAL_PET_CODE='pet-code' \
+  -e TRAINER_PASSWORD_RANDOM_EACH_START=1 \
   -e SESSION_SECRET='long-random-secret' \
   -v clicker_data:/data \
   -v ./server/audio:/data/audio:ro \
@@ -46,6 +48,12 @@ docker compose up --build
 ```
 
 With the included compose file, open `http://localhost:9000`. Compose reads local secrets from `.env`, which is gitignored. After first boot you can add/remove pet codes and trainer accounts from the trainer panel.
+
+When `TRAINER_PASSWORD_RANDOM_EACH_START=1`, Docker prints a fresh admin password every container start and resets the admin account to that password. See it with:
+
+```bash
+docker compose logs trainer
+```
 
 ## Pet Client
 
@@ -61,7 +69,7 @@ cp old/beep.mp3 server/audio/beep.mp3
 cp old/click.mp3 server/audio/click.mp3
 ```
 
-The trainer panel shows the pet login link. The pet opens that link, enters their code, grants camera permission, and leaves the page open. No install is required.
+Fresh databases start with no pets. A trainer must add each pet and code from the training panel. The trainer panel shows the pet login link; the pet opens that link, enters their code, grants camera permission, and leaves the page open. No install is required.
 
 ## Features In V1
 

@@ -7,8 +7,7 @@ services:
       - "9000:8000"
     environment:
       TRAINER_USERNAME: "${TRAINER_USERNAME:-trainer}"
-      TRAINER_PASSWORD: "${TRAINER_PASSWORD:-trainer}"
-      INITIAL_PET_CODE: "${INITIAL_PET_CODE:-pet}"
+      TRAINER_PASSWORD_RANDOM_EACH_START: "${TRAINER_PASSWORD_RANDOM_EACH_START:-1}"
       SESSION_SECRET: "${SESSION_SECRET:-change-this-too}"
       TRAINER_DB_PATH: /data/trainer.sqlite3
       TRAINER_AUDIO_DIR: /data/audio

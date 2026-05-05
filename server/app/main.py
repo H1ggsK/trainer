@@ -28,8 +28,8 @@ DB_PATH = Path(os.environ.get("TRAINER_DB_PATH", ROOT / "server" / "trainer.sqli
 AUDIO_DIR = Path(os.environ.get("TRAINER_AUDIO_DIR", ROOT / "server" / "audio"))
 TRAINER_USERNAME = os.environ.get("TRAINER_USERNAME", "trainer")
 TRAINER_PASSWORD = os.environ.get("TRAINER_PASSWORD", "trainer")
-INITIAL_PET_CODE = os.environ.get("INITIAL_PET_CODE", os.environ.get("PET_TOKEN", "pet"))
 SESSION_SECRET = os.environ.get("SESSION_SECRET", TRAINER_PASSWORD)
+RESET_ADMIN_PASSWORD_ON_START = os.environ.get("RESET_ADMIN_PASSWORD_ON_START") == "1"
 TRAINER_COOKIE = "trainer_session"
 PET_COOKIE = "pet_session"
 SESSION_TTL_SECONDS = 60 * 60 * 12
@@ -133,17 +133,17 @@ class Store:
             }
             if "pet_id" not in log_columns:
                 self.connection.execute("ALTER TABLE logs ADD COLUMN pet_id INTEGER")
+            if RESET_ADMIN_PASSWORD_ON_START:
+                self.connection.execute(
+                    "INSERT INTO trainers(username, password_hash, role, created_at) VALUES(?, ?, 'admin', ?) "
+                    "ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash, role = 'admin'",
+                    (TRAINER_USERNAME, hash_password(TRAINER_PASSWORD), now_iso()),
+                )
             trainer_count = self.connection.execute("SELECT COUNT(*) AS count FROM trainers").fetchone()["count"]
             if trainer_count == 0:
                 self.connection.execute(
                     "INSERT INTO trainers(username, password_hash, role, created_at) VALUES(?, ?, 'admin', ?)",
                     (TRAINER_USERNAME, hash_password(TRAINER_PASSWORD), now_iso()),
-                )
-            pet_count = self.connection.execute("SELECT COUNT(*) AS count FROM pets").fetchone()["count"]
-            if pet_count == 0:
-                self.connection.execute(
-                    "INSERT INTO pets(name, code, created_at) VALUES('Default pet', ?, ?)",
-                    (INITIAL_PET_CODE, now_iso()),
                 )
             self.connection.commit()
 
@@ -428,14 +428,20 @@ class Hub:
             await self.broadcast_clients(pet_id, {"type": "settings", "settings": self._client_settings(pet)})
 
     async def state(self, me: dict[str, str] | None = None) -> dict[str, Any]:
-        pets = await self.store.list_pets()
-        await self._expire_stay_if_needed(pets)
-        pets = await self.store.list_pets()
+        role = me.get("role") if me else None
+        pets: list[dict[str, Any]] = []
+        trainers: list[dict[str, Any]] = []
+        if role == "trainer":
+            pets = await self.store.list_pets()
+            await self._expire_stay_if_needed(pets)
+            pets = await self.store.list_pets()
+        elif role == "admin":
+            trainers = await self.store.list_trainers()
         return {
             "protocol_version": PROTOCOL_VERSION,
             "me": me,
             "pets": [self._public_pet(pet) for pet in pets],
-            "trainers": await self.store.list_trainers() if me and me.get("role") == "admin" else [],
+            "trainers": trainers,
             "audio": {
                 "beep_exists": (AUDIO_DIR / "beep.mp3").exists(),
                 "click_exists": (AUDIO_DIR / "click.mp3").exists(),
@@ -449,7 +455,9 @@ class Hub:
             try:
                 if payload is None:
                     await self.send_to_trainer(trainer)
-                else:
+                elif payload.get("type") == "live_frame" and trainer_from_cookie(trainer.cookies.get(TRAINER_COOKIE), role="trainer"):
+                    await trainer.send_json(payload)
+                elif payload.get("type") != "live_frame":
                     await trainer.send_json(payload)
             except Exception:
                 stale.append(trainer)
@@ -458,8 +466,9 @@ class Hub:
 
     async def send_to_trainer(self, websocket: WebSocket) -> None:
         me = trainer_from_cookie(websocket.cookies.get(TRAINER_COOKIE))
+        logs = [] if me and me.get("role") == "admin" else await self.store.recent_logs(120)
         await websocket.send_json(
-            {"type": "state", "state": await self.state(me), "logs": await self.store.recent_logs(120)}
+            {"type": "state", "state": await self.state(me), "logs": logs}
         )
 
     async def broadcast_clients(self, pet_id: int, payload: dict[str, Any]) -> None:
@@ -549,14 +558,17 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
 
-def trainer_from_cookie(cookie: str | None) -> dict[str, str] | None:
+def trainer_from_cookie(cookie: str | None, role: str | None = None) -> dict[str, str] | None:
     value = unsign(cookie)
     if not value:
         return None
     parts = value.split("|")
     if len(parts) != 4 or parts[0] != "trainer":
         return None
-    return {"username": parts[1], "role": parts[2]}
+    me = {"username": parts[1], "role": parts[2]}
+    if role is not None and me["role"] != role:
+        return None
+    return me
 
 
 def pet_id_from_cookie(cookie: str | None) -> int | None:
@@ -573,15 +585,15 @@ def pet_id_from_cookie(cookie: str | None) -> int | None:
 
 
 def require_trainer(request: Request) -> dict[str, str]:
-    me = trainer_from_cookie(request.cookies.get(TRAINER_COOKIE))
+    me = trainer_from_cookie(request.cookies.get(TRAINER_COOKIE), role="trainer")
     if not me:
-        raise HTTPException(status_code=401, detail="Not logged in")
+        raise HTTPException(status_code=403, detail="Trainer account required")
     return me
 
 
 def require_admin(request: Request) -> dict[str, str]:
-    me = require_trainer(request)
-    if me["role"] != "admin":
+    me = trainer_from_cookie(request.cookies.get(TRAINER_COOKIE), role="admin")
+    if not me:
         raise HTTPException(status_code=403, detail="Admin only")
     return me
 
@@ -595,53 +607,96 @@ def render_page(title: str, body: str) -> HTMLResponse:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
-:root {{ color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; }}
-body {{ margin: 0; background: #f5f6f8; color: #17191c; }}
+:root {{ color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; --bg: #f5f6f8; --text: #17191c; --panel: #ffffff; --border: #dde2ea; --soft-border: #e4e8ef; --input: #ffffff; --muted: #687282; --primary: #1f6feb; --secondary-bg: #e7eaee; --secondary-text: #20242a; --ok-bg: #dff6e8; --ok-text: #136c36; --bad-bg: #ffe1e1; --bad-text: #9b1c20; --camera-bg: #12161c; }}
+:root.dark {{ color-scheme: dark; --bg: #111418; --text: #f2f5f8; --panel: #1a1f26; --border: #303844; --soft-border: #313945; --input: #111820; --muted: #a1abb8; --primary: #4c8dff; --secondary-bg: #2a323d; --secondary-text: #f2f5f8; --ok-bg: #153c25; --ok-text: #8ee0aa; --bad-bg: #4a1d22; --bad-text: #ff9aa2; --camera-bg: #080a0d; }}
+body {{ margin: 0; background: var(--bg); color: var(--text); }}
 button, input, select {{ font: inherit; }}
-button {{ border: 0; border-radius: 6px; padding: 10px 13px; background: #1f6feb; color: white; cursor: pointer; transition: transform .08s ease, opacity .12s ease; }}
+button {{ border: 0; border-radius: 6px; padding: 10px 13px; background: var(--primary); color: white; cursor: pointer; transition: transform .08s ease, opacity .12s ease; }}
 button:active {{ transform: translateY(1px); }}
-button.secondary {{ background: #e7eaee; color: #20242a; }}
+button.secondary {{ background: var(--secondary-bg); color: var(--secondary-text); }}
 button.danger {{ background: #bc2f32; }}
 button.busy {{ opacity: .7; }}
 button:disabled {{ opacity: .45; cursor: not-allowed; }}
-input, select {{ border: 1px solid #c8ced8; border-radius: 6px; padding: 9px 10px; background: white; }}
+input, select {{ border: 1px solid var(--border); border-radius: 6px; padding: 9px 10px; background: var(--input); color: var(--text); }}
 h1, h2, h3 {{ margin: 0; }}
 .shell {{ max-width: 1280px; margin: 0 auto; padding: 24px; }}
 .top {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }}
 .grid {{ display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: start; }}
-.panel {{ background: white; border: 1px solid #dde2ea; border-radius: 8px; padding: 16px; }}
+.panel {{ background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }}
 .stack {{ display: grid; gap: 12px; }}
 .row {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
 .field {{ display: grid; gap: 6px; }}
-.field label {{ color: #586170; font-size: 13px; }}
-.badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 9px; background: #eef1f5; color: #3d4652; font-size: 13px; }}
-.badge.ok {{ background: #dff6e8; color: #136c36; }}
-.badge.bad {{ background: #ffe1e1; color: #9b1c20; }}
+.field label {{ color: var(--muted); font-size: 13px; }}
+.badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 9px; background: var(--secondary-bg); color: var(--secondary-text); font-size: 13px; }}
+.badge.ok {{ background: var(--ok-bg); color: var(--ok-text); }}
+.badge.bad {{ background: var(--bad-bg); color: var(--bad-text); }}
 .list {{ display: grid; gap: 8px; }}
-.item {{ border: 1px solid #e4e8ef; border-radius: 8px; padding: 10px; display: grid; gap: 6px; }}
-.item.active {{ border-color: #1f6feb; box-shadow: inset 3px 0 0 #1f6feb; }}
+.item {{ border: 1px solid var(--soft-border); border-radius: 8px; padding: 10px; display: grid; gap: 6px; }}
+.item.active {{ border-color: var(--primary); box-shadow: inset 3px 0 0 var(--primary); }}
 .toolbar {{ display: flex; gap: 8px; flex-wrap: wrap; }}
 .logs {{ height: 360px; overflow: auto; display: grid; align-content: start; gap: 8px; }}
-.log {{ display: grid; grid-template-columns: 170px 120px 1fr; gap: 10px; border-bottom: 1px solid #edf0f4; padding-bottom: 8px; }}
-.time, .quiet {{ color: #687282; }}
+.log {{ display: grid; grid-template-columns: 170px 120px 1fr; gap: 10px; border-bottom: 1px solid var(--soft-border); padding-bottom: 8px; }}
+.time, .quiet {{ color: var(--muted); }}
+[hidden] {{ display: none !important; }}
 .login, .pet {{ min-height: 100vh; display: grid; place-items: center; padding: 24px; }}
-.login form, .pet main {{ width: min(460px, 100%); }}
-.camera {{ width: 100%; aspect-ratio: 16 / 9; background: #12161c; border-radius: 8px; object-fit: cover; transform: scaleX(-1); }}
-.live {{ width: 100%; max-width: 560px; aspect-ratio: 16 / 9; object-fit: cover; background: #12161c; border-radius: 8px; transform: scaleX(-1); }}
-#toast {{ min-height: 22px; color: #136c36; }}
+.login form {{ width: min(460px, 100%); }}
+.pet main {{ width: min(900px, 100%); }}
+.camera {{ width: 100%; aspect-ratio: 16 / 9; background: var(--camera-bg); border-radius: 8px; object-fit: cover; transform: scaleX(-1); }}
+.live {{ width: 100%; max-width: 980px; aspect-ratio: 16 / 9; object-fit: cover; background: var(--camera-bg); border-radius: 8px; }}
+.live[hidden] {{ display: none; }}
+.stay-warning {{ color: var(--bad-text); font-size: 20px; font-weight: 800; text-transform: uppercase; }}
+.theme-toggle {{ position: fixed; right: 16px; bottom: 16px; z-index: 10; box-shadow: 0 8px 24px rgb(0 0 0 / .18); }}
+#toast {{ min-height: 22px; color: var(--ok-text); }}
 @media (max-width: 880px) {{ .grid {{ grid-template-columns: 1fr; }} .log {{ grid-template-columns: 1fr; }} }}
 </style>
+<script>
+(() => {{
+  const mode = localStorage.getItem('theme') || 'light';
+  document.documentElement.classList.toggle('dark', mode === 'dark');
+}})();
+</script>
 </head>
-<body>{body}</body>
+<body>{body}
+<button id="themeToggle" class="secondary theme-toggle" type="button">Dark</button>
+<script>
+(() => {{
+  const button = document.getElementById('themeToggle');
+  const sync = () => {{
+    const dark = document.documentElement.classList.contains('dark');
+    button.textContent = dark ? 'Light' : 'Dark';
+  }};
+  button.addEventListener('click', () => {{
+    const dark = !document.documentElement.classList.contains('dark');
+    document.documentElement.classList.toggle('dark', dark);
+    localStorage.setItem('theme', dark ? 'dark' : 'light');
+    sync();
+  }});
+  sync();
+}})();
+</script>
+</body>
 </html>"""
     )
 
 
 @app.get("/")
 async def index(request: Request) -> HTMLResponse:
-    if not trainer_from_cookie(request.cookies.get(TRAINER_COOKIE)):
+    me = trainer_from_cookie(request.cookies.get(TRAINER_COOKIE))
+    if not me:
         return render_page("Trainer Login", LOGIN_HTML)
+    if me["role"] != "trainer":
+        return render_page("Trainer Panel", WRONG_ROLE_HTML.replace("__TARGET__", "/admin").replace("__LABEL__", "Admin dashboard"))
     return render_page("Trainer Panel", TRAINER_HTML.replace("__PROTOCOL__", PROTOCOL_VERSION))
+
+
+@app.get("/admin")
+async def admin_page(request: Request) -> HTMLResponse:
+    me = trainer_from_cookie(request.cookies.get(TRAINER_COOKIE))
+    if not me:
+        return render_page("Admin Login", LOGIN_HTML)
+    if me["role"] != "admin":
+        return render_page("Admin Dashboard", WRONG_ROLE_HTML.replace("__TARGET__", "/").replace("__LABEL__", "Trainer panel"))
+    return render_page("Admin Dashboard", ADMIN_HTML.replace("__PROTOCOL__", PROTOCOL_VERSION))
 
 
 @app.get("/pet")
@@ -655,7 +710,7 @@ async def login(request: Request) -> Response:
     trainer = await store.authenticate_trainer(str(payload.get("username", "")), str(payload.get("password", "")))
     if not trainer:
         raise HTTPException(status_code=401, detail="Bad login")
-    response = JSONResponse({"ok": True})
+    response = JSONResponse({"ok": True, "role": trainer["role"]})
     response.set_cookie(
         TRAINER_COOKIE,
         sign(f"trainer|{trainer['username']}|{trainer['role']}|{int(time.time())}"),
@@ -663,6 +718,13 @@ async def login(request: Request) -> Response:
         samesite="lax",
         max_age=SESSION_TTL_SECONDS,
     )
+    return response
+
+
+@app.post("/api/logout")
+async def logout() -> Response:
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(TRAINER_COOKIE)
     return response
 
 
@@ -680,6 +742,24 @@ async def pet_login(request: Request) -> Response:
         samesite="lax",
         max_age=SESSION_TTL_SECONDS,
     )
+    return response
+
+
+@app.get("/api/pet/me")
+async def pet_me(request: Request) -> dict[str, Any]:
+    pet_id = pet_id_from_cookie(request.cookies.get(PET_COOKIE))
+    if pet_id is None:
+        raise HTTPException(status_code=401, detail="Not in a pet session")
+    pet = await store.get_pet(pet_id)
+    if not pet:
+        raise HTTPException(status_code=401, detail="Pet session expired")
+    return {"ok": True, "pet": {"id": pet["id"], "name": pet["name"]}}
+
+
+@app.post("/api/pet/logout")
+async def pet_logout() -> Response:
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(PET_COOKIE)
     return response
 
 
@@ -780,7 +860,21 @@ async def healthz() -> PlainTextResponse:
 
 @app.websocket("/ws/trainer")
 async def trainer_ws(websocket: WebSocket) -> None:
-    if not trainer_from_cookie(websocket.cookies.get(TRAINER_COOKIE)):
+    if not trainer_from_cookie(websocket.cookies.get(TRAINER_COOKIE), role="trainer"):
+        await websocket.close(code=4403)
+        return
+    await websocket.accept()
+    await hub.register_trainer(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        await hub.unregister_trainer(websocket)
+
+
+@app.websocket("/ws/admin")
+async def admin_ws(websocket: WebSocket) -> None:
+    if not trainer_from_cookie(websocket.cookies.get(TRAINER_COOKIE), role="admin"):
         await websocket.close(code=4401)
         return
     await websocket.accept()
@@ -846,9 +940,98 @@ login.addEventListener('submit', async (event) => {
     headers: {'content-type': 'application/json'},
     body: JSON.stringify({username: username.value, password: password.value})
   });
-  if (res.ok) location.reload();
+  if (res.ok) {
+    const payload = await res.json();
+    location.href = payload.role === 'admin' ? '/admin' : '/';
+  }
   else error.textContent = 'Login failed';
 });
+</script>
+"""
+
+
+WRONG_ROLE_HTML = """
+<div class="login">
+<main class="panel stack" style="width:min(460px,100%)">
+  <h1>Wrong account type</h1>
+  <p class="quiet">This account cannot access this page.</p>
+  <div class="row">
+    <a href="__TARGET__">__LABEL__</a>
+    <button id="logout">Log Out</button>
+  </div>
+</main>
+</div>
+<script>
+logout.onclick = async () => { await fetch('/api/logout', {method: 'POST'}); location.href = '/'; };
+</script>
+"""
+
+
+ADMIN_HTML = """
+<div class="shell">
+  <div class="top">
+    <div>
+      <h1>Admin Dashboard</h1>
+      <div class="quiet">Protocol __PROTOCOL__</div>
+    </div>
+    <div class="row"><div id="toast"></div><button class="secondary" id="logout">Log Out</button></div>
+  </div>
+  <main class="panel stack">
+    <h2>Trainers</h2>
+    <div class="row">
+      <input id="trainerName" placeholder="username">
+      <input id="trainerPassword" placeholder="password" type="password">
+      <select id="trainerRole"><option value="trainer">trainer</option><option value="admin">admin</option></select>
+      <button id="addTrainer">Add / Update Trainer</button>
+    </div>
+    <div id="trainerList" class="list"></div>
+  </main>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let state = null;
+function showToast(text) {
+  $('toast').textContent = text;
+  clearTimeout(showToast.t);
+  showToast.t = setTimeout(() => $('toast').textContent = '', 1600);
+}
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
+async function post(url, body, button) {
+  const old = button ? button.textContent : '';
+  if (button) { button.disabled = true; button.classList.add('busy'); button.textContent = 'Saving...'; }
+  const res = await fetch(url, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body || {})});
+  if (button) { button.disabled = false; button.classList.remove('busy'); button.textContent = old; }
+  if (!res.ok) { alert(await res.text()); return null; }
+  showToast('Saved');
+  return res.json();
+}
+async function del(url, button) {
+  const old = button ? button.textContent : '';
+  if (button) { button.disabled = true; button.textContent = 'Removing...'; }
+  const res = await fetch(url, {method: 'DELETE'});
+  if (button) { button.disabled = false; button.textContent = old; }
+  if (!res.ok) alert(await res.text()); else showToast('Removed');
+}
+function render(payload) {
+  if (payload?.state) state = payload.state;
+  $('trainerList').innerHTML = (state?.trainers || []).map((trainer) => `
+    <div class="item">
+      <strong>${esc(trainer.username)}</strong>
+      <span class="quiet">${esc(trainer.role)}</span>
+      <button class="danger" onclick="removeTrainer('${esc(trainer.username)}', this)">Remove</button>
+    </div>`).join('');
+}
+window.removeTrainer = (username, button) => del(`/api/trainers/${username}`, button);
+$('addTrainer').onclick = (e) => post('/api/trainers', {username: $('trainerName').value, password: $('trainerPassword').value, role: $('trainerRole').value}, e.target);
+$('logout').onclick = async () => { await fetch('/api/logout', {method: 'POST'}); location.href = '/'; };
+function connectAdminWs() {
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/admin`);
+  ws.onmessage = (event) => render(JSON.parse(event.data));
+  ws.onclose = () => setTimeout(connectAdminWs, 1500);
+}
+connectAdminWs();
 </script>
 """
 
@@ -860,7 +1043,7 @@ TRAINER_HTML = """
       <h1>Clicker Trainer</h1>
       <div class="quiet">Protocol __PROTOCOL__</div>
     </div>
-    <div id="toast"></div>
+    <div class="row"><div id="toast"></div><button class="secondary" id="logout">Log Out</button></div>
   </div>
   <div class="grid">
     <aside class="panel stack">
@@ -885,7 +1068,7 @@ TRAINER_HTML = """
           <button class="secondary" id="liveOn">Live Feed On</button>
           <button class="secondary" id="liveOff">Live Feed Off</button>
         </div>
-        <img id="liveImage" class="live" alt="Live feed preview">
+        <canvas id="liveCanvas" class="live" hidden></canvas>
         <div id="liveState" class="quiet"></div>
       </section>
       <section class="panel stack">
@@ -912,16 +1095,6 @@ TRAINER_HTML = """
         </div>
         <div id="randomState" class="quiet"></div>
       </section>
-      <section class="panel stack" id="adminPanel" hidden>
-        <h2>Admin</h2>
-        <div class="row">
-          <input id="trainerName" placeholder="username">
-          <input id="trainerPassword" placeholder="password" type="password">
-          <select id="trainerRole"><option value="trainer">trainer</option><option value="admin">admin</option></select>
-          <button id="addTrainer">Add / Update Trainer</button>
-        </div>
-        <div id="trainerList" class="list"></div>
-      </section>
       <section class="panel stack">
         <h2>Event Log</h2>
         <div class="logs" id="logs"></div>
@@ -934,6 +1107,7 @@ const $ = (id) => document.getElementById(id);
 let state = null;
 let logs = [];
 let selectedPetId = null;
+let liveFramePetId = null;
 
 function showToast(text) {
   $('toast').textContent = text;
@@ -970,10 +1144,21 @@ function esc(value) {
 }
 function selectedPet() { return state?.pets.find((pet) => pet.id === selectedPetId) || state?.pets[0]; }
 
+function clearLiveCanvas() {
+  const liveCanvas = $('liveCanvas');
+  const liveContext = liveCanvas.getContext('2d');
+  liveContext.clearRect(0, 0, liveCanvas.width, liveCanvas.height);
+  liveCanvas.hidden = true;
+  liveFramePetId = null;
+}
+
 function renderPets() {
   const pets = state.pets;
   if (!selectedPetId && pets.length) selectedPetId = pets[0].id;
-  if (!pets.some((pet) => pet.id === selectedPetId)) selectedPetId = pets[0]?.id || null;
+  if (!pets.some((pet) => pet.id === selectedPetId)) {
+    selectedPetId = pets[0]?.id || null;
+    clearLiveCanvas();
+  }
   $('petList').innerHTML = pets.map((pet) => `
     <div class="item ${pet.id === selectedPetId ? 'active' : ''}">
       <strong>${esc(pet.name)}</strong>
@@ -1008,28 +1193,19 @@ function renderSelected() {
   $('liveState').textContent = pet.live_allowed
     ? (pet.live_enabled ? 'Client allowed live feed; trainer view is on.' : 'Client allowed live feed; trainer view is off.')
     : 'Client has not allowed live feed.';
-}
-
-function renderAdmin() {
-  const isAdmin = state.me?.role === 'admin';
-  $('adminPanel').hidden = !isAdmin;
-  if (!isAdmin) return;
-  $('trainerList').innerHTML = state.trainers.map((trainer) => `
-    <div class="item">
-      <strong>${esc(trainer.username)}</strong>
-      <span class="quiet">${esc(trainer.role)}</span>
-      <button class="danger" onclick="removeTrainer('${esc(trainer.username)}', this)">Remove</button>
-    </div>`).join('');
+  if (!pet.live_allowed || !pet.live_enabled || liveFramePetId !== pet.id) clearLiveCanvas();
 }
 
 function renderLogs() {
+  const logBox = $('logs');
+  const wasNearBottom = logBox.scrollTop + logBox.clientHeight >= logBox.scrollHeight - 24;
   $('logs').innerHTML = logs.map((log) => `
     <div class="log">
       <span class="time">${log.created_at}</span>
       <span>${esc(log.pet_name || '')}</span>
       <strong>${esc(log.event.replaceAll('_', ' '))}</strong>
     </div>`).join('');
-  $('logs').scrollTop = $('logs').scrollHeight;
+  if (wasNearBottom) logBox.scrollTop = logBox.scrollHeight;
 }
 
 function render(payload) {
@@ -1037,34 +1213,44 @@ function render(payload) {
   if (payload?.logs) logs = payload.logs;
   renderPets();
   renderSelected();
-  renderAdmin();
   renderLogs();
 }
 
-window.selectPet = (id) => { selectedPetId = id; render({state, logs}); };
+window.selectPet = (id) => { selectedPetId = id; clearLiveCanvas(); render({state, logs}); };
 window.changeCode = async (id) => {
   const code = prompt('New code');
   if (code) await post(`/api/pets/${id}/code`, {code});
 };
 window.removePet = (id, button) => del(`/api/pets/${id}`, button);
-window.removeTrainer = (username, button) => del(`/api/trainers/${username}`, button);
 
 $('addPet').onclick = (e) => post('/api/pets', {name: $('newPetName').value, code: $('newPetCode').value}, e.target);
 $('manualClick').onclick = (e) => post(`/api/pets/${selectedPet().id}/click`, {}, e.target);
-$('liveOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/live`, {enabled: true}, e.target);
-$('liveOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/live`, {enabled: false}, e.target);
+$('liveOn').onclick = (e) => { clearLiveCanvas(); post(`/api/pets/${selectedPet().id}/live`, {enabled: true}, e.target); };
+$('liveOff').onclick = (e) => { clearLiveCanvas(); post(`/api/pets/${selectedPet().id}/live`, {enabled: false}, e.target); };
 $('stayOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled: true, duration_seconds: Number($('stayDuration').value || 0) || null}, e.target);
 $('stayOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled: false}, e.target);
 $('randomOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/random-click`, {enabled: true, min_seconds: Number($('clickMin').value || 30), max_seconds: Number($('clickMax').value || 300)}, e.target);
 $('randomOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/random-click`, {enabled: false, min_seconds: Number($('clickMin').value || 30), max_seconds: Number($('clickMax').value || 300)}, e.target);
-$('addTrainer').onclick = (e) => post('/api/trainers', {username: $('trainerName').value, password: $('trainerPassword').value, role: $('trainerRole').value}, e.target);
 $('copyLink').onclick = async () => { await navigator.clipboard.writeText($('petLink').value); showToast('Copied'); };
+$('logout').onclick = async () => { await fetch('/api/logout', {method: 'POST'}); location.href = '/'; };
 
 function connectTrainerWs() {
+  const liveCanvas = $('liveCanvas');
+  const liveContext = liveCanvas.getContext('2d');
   const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/trainer`);
   ws.onmessage = (event) => {
     const payload = JSON.parse(event.data);
-    if (payload.type === 'live_frame' && selectedPetId === payload.pet_id) $('liveImage').src = payload.frame;
+    if (payload.type === 'live_frame' && selectedPetId === payload.pet_id) {
+      const image = new Image();
+      image.onload = () => {
+        liveCanvas.width = image.naturalWidth;
+        liveCanvas.height = image.naturalHeight;
+        liveContext.drawImage(image, 0, 0);
+        liveFramePetId = payload.pet_id;
+        liveCanvas.hidden = false;
+      };
+      image.src = payload.frame;
+    }
     else render(payload);
   };
   ws.onclose = () => setTimeout(connectTrainerWs, 1500);
@@ -1085,27 +1271,57 @@ PET_HTML = """
     <p class="quiet" id="loginError"></p>
   </section>
   <section id="clientPanel" class="stack" hidden>
-    <h1 id="petName">Training Client</h1>
+    <div class="row" style="justify-content:space-between">
+      <h1 id="petName">Training Client</h1>
+      <button id="leavePet" class="secondary" type="button">Leave Session</button>
+    </div>
     <video id="video" class="camera" playsinline muted></video>
     <div class="row">
       <span id="status" class="badge">Starting</span>
-      <span id="detectedParts" class="quiet">No parts detected yet</span>
+      <span id="stayWarning" class="stay-warning" hidden>Stay in frame</span>
     </div>
-    <label class="row"><input id="allowLive" type="checkbox"> Allow trainer live feed</label>
-    <button id="start">Start Camera</button>
+    <ol id="loadSteps" class="quiet" style="margin:0;padding-left:22px" hidden>
+      <li id="stepCamera">Camera permission</li>
+      <li id="stepJs">MediaPipe JS</li>
+      <li id="stepWasm">MediaPipe WASM</li>
+      <li id="stepModel">Pose model</li>
+      <li id="stepDetect">Detection loop</li>
+    </ol>
+    <p id="clientMessage" class="quiet" hidden></p>
+    <div class="row">
+      <label class="row"><input id="allowLive" type="checkbox"> Allow trainer live feed</label>
+      <button id="enableSound" class="secondary" type="button" hidden>Enable sound</button>
+    </div>
   </section>
   <canvas id="canvas" hidden></canvas>
 </main>
 </div>
-<script type="module">
-import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.19/vision_bundle.mjs";
-
+<script>
 const PROTOCOL_VERSION = "__PROTOCOL__";
+const codePanel = document.getElementById('codePanel');
+const clientPanel = document.getElementById('clientPanel');
+const petCode = document.getElementById('petCode');
+const loginPet = document.getElementById('loginPet');
+const loginError = document.getElementById('loginError');
+const petName = document.getElementById('petName');
+const leavePet = document.getElementById('leavePet');
+const video = document.getElementById('video');
+const status = document.getElementById('status');
+const stayWarning = document.getElementById('stayWarning');
+const clientMessage = document.getElementById('clientMessage');
+const allowLive = document.getElementById('allowLive');
+const enableSound = document.getElementById('enableSound');
+const canvas = document.getElementById('canvas');
+const loadSteps = document.getElementById('loadSteps');
+const loadStepIds = ['stepCamera', 'stepJs', 'stepWasm', 'stepModel', 'stepDetect'];
 const beep = new Audio('/audio/beep.mp3');
 const click = new Audio('/audio/click.mp3');
 beep.loop = true;
+beep.preload = 'auto';
+click.preload = 'auto';
 let ws = null;
 let poseLandmarker = null;
+let faceDetector = null;
 let stayEnabled = false;
 let lastPresent = null;
 let lastParts = '';
@@ -1113,15 +1329,84 @@ let lastSent = 0;
 let running = false;
 let liveRequested = false;
 let lastLiveAt = 0;
+let liveTimer = null;
+let cameraStream = null;
+let intentionalDisconnect = false;
+let audioUnlocked = false;
 
 function setStatus(text, cls = '') {
   status.className = `badge ${cls}`;
   status.textContent = text;
 }
 
-loginPet.onclick = async () => {
+function setMessage(text = '') {
+  clientMessage.textContent = text;
+  clientMessage.hidden = !text;
+}
+
+async function unlockAudio() {
+  if (audioUnlocked) return true;
+  enableSound.hidden = true;
+  const promises = [];
+  for (const audio of [beep, click]) {
+    const previousMuted = audio.muted;
+    const previousVolume = audio.volume;
+    audio.muted = true;
+    audio.volume = 0;
+    const attempt = audio.play();
+    if (attempt) {
+      promises.push(
+        attempt.then(() => {
+          audio.pause();
+          audio.currentTime = 0;
+          audio.muted = previousMuted;
+          audio.volume = previousVolume;
+          return true;
+        }).catch(() => {
+          audio.muted = previousMuted;
+          audio.volume = previousVolume;
+          return false;
+        })
+      );
+    }
+  }
+  const results = await Promise.all(promises);
+  audioUnlocked = results.every(result => result);
+  if (!audioUnlocked) {
+    enableSound.hidden = false;
+  }
+  return audioUnlocked;
+}
+
+function setStep(id, state) {
+  const item = document.getElementById(id);
+  if (!item) return;
+  const prefix = state === 'done' ? '[done] ' : state === 'active' ? '[...] ' : state === 'error' ? '[error] ' : '';
+  item.dataset.state = state;
+  item.textContent = prefix + item.textContent.replace(/^\\[(done|\\.\\.\\.|error)\\] /, '');
+  item.style.color = state === 'done' ? 'var(--ok-text)' : state === 'error' ? 'var(--bad-text)' : '';
+}
+
+function resetSteps() {
+  loadSteps.hidden = false;
+  for (const id of loadStepIds) setStep(id, 'idle');
+}
+
+async function beginPetSession(pet) {
+  intentionalDisconnect = false;
+  petName.textContent = pet.name;
+  codePanel.hidden = true;
+  clientPanel.hidden = false;
+  enableSound.hidden = audioUnlocked;
+  resetSteps();
+  await startClient();
+}
+
+async function submitPetCode() {
+  await unlockAudio();
   loginPet.disabled = true;
   loginPet.textContent = 'Checking...';
+  loginError.textContent = '';
   const res = await fetch('/api/pet/login', {
     method: 'POST',
     headers: {'content-type': 'application/json'},
@@ -1134,9 +1419,45 @@ loginPet.onclick = async () => {
     return;
   }
   const payload = await res.json();
-  petName.textContent = payload.pet.name;
-  codePanel.hidden = true;
-  clientPanel.hidden = false;
+  beginPetSession(payload.pet).catch((error) => {
+    console.error(error);
+    for (const id of loadStepIds) {
+      const item = document.getElementById(id);
+      if (item?.dataset.state === 'active') setStep(id, 'error');
+    }
+    setStatus('Camera/model failed', 'bad');
+    setMessage(error?.message || 'Startup failed');
+    running = false;
+  });
+}
+
+loginPet.onclick = () => submitPetCode();
+petCode.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') submitPetCode();
+});
+
+leavePet.onclick = async () => {
+  intentionalDisconnect = true;
+  await fetch('/api/pet/logout', {method: 'POST'});
+  if (ws) ws.close();
+  if (liveTimer) clearInterval(liveTimer);
+  if (cameraStream) cameraStream.getTracks().forEach((track) => track.stop());
+  ws = null;
+  liveTimer = null;
+  cameraStream = null;
+  poseLandmarker = null;
+  faceDetector = null;
+  running = false;
+  lastPresent = null;
+  lastParts = '';
+  stayEnabled = false;
+  stayWarning.hidden = true;
+  clientPanel.hidden = true;
+  codePanel.hidden = false;
+  petCode.value = '';
+  loginPet.disabled = false;
+  loginPet.textContent = 'Continue';
+  petCode.focus();
 };
 
 allowLive.onchange = () => {
@@ -1145,25 +1466,31 @@ allowLive.onchange = () => {
   }
 };
 
+enableSound.onclick = async () => {
+  await unlockAudio();
+  setTimeout(async () => await updateBeep(lastPresent), 150);
+};
+
 function connectWs() {
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/pet?version=${encodeURIComponent(PROTOCOL_VERSION)}`);
   ws.onopen = () => {
-    setStatus('Connected', 'ok');
     ws.send(JSON.stringify({type: 'live_allowed', allowed: allowLive.checked}));
   };
   ws.onclose = () => {
     setStatus('Reconnecting');
-    setTimeout(connectWs, 1500);
+    if (!intentionalDisconnect) setTimeout(connectWs, 1500);
   };
   ws.onmessage = async (event) => {
     const message = JSON.parse(event.data);
     if (message.type === 'settings') {
       stayEnabled = Boolean(message.settings.stay_in_frame_enabled);
-      updateBeep(lastPresent);
+      stayWarning.hidden = !stayEnabled;
+      await updateBeep(lastPresent);
     }
     if (message.type === 'play_click') {
+      if (!audioUnlocked) await unlockAudio();
       click.currentTime = 0;
-      await click.play().catch(() => {});
+      await click.play().catch((error) => setMessage(`Click sound blocked: ${error.message || error}`));
     }
     if (message.type === 'live_request') {
       liveRequested = Boolean(message.enabled);
@@ -1172,49 +1499,72 @@ function connectWs() {
   };
 }
 
-function updateBeep(present) {
-  if (stayEnabled && present === false) beep.play().catch(() => {});
-  else { beep.pause(); beep.currentTime = 0; }
+async function updateBeep(present) {
+  if (stayEnabled && present === false) {
+    if (!audioUnlocked) await unlockAudio();
+    beep.play().catch((error) => setMessage(`Beep sound blocked: ${error.message || error}`));
+  } else {
+    beep.pause();
+    beep.currentTime = 0;
+  }
 }
 
 function classifyParts(landmarks) {
   const visible = (indexes) => indexes.some((i) => landmarks[i] && (landmarks[i].visibility ?? 1) > 0.35);
+  const visibleCount = landmarks.filter((point) => (point.visibility ?? 1) > 0.35).length;
   const parts = [];
   if (visible([0, 1, 2, 3, 4, 5, 6, 7, 8])) parts.push('head/profile');
   if (visible([11, 12])) parts.push('shoulders');
+  if (visible([11, 12, 23, 24])) parts.push('torso');
   if (visible([13, 14, 15, 16])) parts.push('arms/hands');
   if (visible([23, 24])) parts.push('hips');
   if (visible([25, 26, 27, 28, 29, 30, 31, 32])) parts.push('legs/feet');
+  if (!parts.length && visibleCount > 0) parts.push('body part');
   return parts;
 }
 
-function analyze(result) {
-  if (!result.landmarks || !result.landmarks.length) return {present: false, confidence: 0, parts: []};
+async function analyze(result) {
+  if (!result.landmarks || !result.landmarks.length) {
+    if (faceDetector) {
+      try {
+        const faces = await faceDetector.detect(video);
+        if (faces.length) return {present: true, confidence: 0.75, parts: ['head/profile']};
+      } catch (_) {}
+    }
+    return {present: false, confidence: 0, parts: []};
+  }
   const landmarks = result.landmarks[0];
   const visibleCount = landmarks.filter((point) => (point.visibility ?? 1) > 0.35).length;
   const parts = classifyParts(landmarks);
   return {present: parts.length > 0 || visibleCount >= 2, confidence: Math.min(1, visibleCount / 12), parts};
 }
 
-function sendPresence(present, confidence, parts) {
+async function sendPresence(present, confidence, parts) {
   const now = performance.now();
   const partsText = parts.join(', ');
-  detectedParts.textContent = partsText ? `Detected: ${partsText}` : 'No body parts detected';
   setStatus(present ? 'In frame' : 'Out of frame', present ? 'ok' : 'bad');
   if (present === lastPresent && partsText === lastParts && now - lastSent < 5000) return;
   lastPresent = present;
   lastParts = partsText;
   lastSent = now;
-  updateBeep(present);
+  await updateBeep(present);
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({type: 'presence', present, confidence, parts}));
   }
 }
 
 async function initPose() {
-  setStatus('Loading model');
-  const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.19/wasm");
-  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+  setStatus('Loading MediaPipe JS');
+  setStep('stepJs', 'active');
+  const mediaPipe = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.19/vision_bundle.mjs");
+  setStep('stepJs', 'done');
+  setStatus('Loading MediaPipe WASM');
+  setStep('stepWasm', 'active');
+  const vision = await mediaPipe.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.19/wasm");
+  setStep('stepWasm', 'done');
+  setStatus('Loading pose model');
+  setStep('stepModel', 'active');
+  poseLandmarker = await mediaPipe.PoseLandmarker.createFromOptions(vision, {
     baseOptions: {
       modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
       delegate: "GPU"
@@ -1222,17 +1572,31 @@ async function initPose() {
     runningMode: "VIDEO",
     numPoses: 1
   });
+  setStep('stepModel', 'done');
+  if ('FaceDetector' in window) {
+    try {
+      faceDetector = new FaceDetector({fastMode: true, maxDetectedFaces: 1});
+    } catch (_) {
+      faceDetector = null;
+    }
+  }
 }
 
 async function startClient() {
   if (running) return;
   running = true;
-  start.disabled = true;
-  connectWs();
-  await initPose();
+  setMessage('');
+  setStatus('Requesting camera');
+  setStep('stepCamera', 'active');
   const stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: 'user'}, audio: false});
+  cameraStream = stream;
+  setStep('stepCamera', 'done');
   video.srcObject = stream;
   await video.play();
+  connectWs();
+  await initPose();
+  setStep('stepDetect', 'active');
+  liveTimer = setInterval(() => maybeSendLiveFrame(performance.now()), 500);
   requestAnimationFrame(loop);
 }
 
@@ -1244,29 +1608,32 @@ function maybeSendLiveFrame(now) {
   canvas.width = width;
   canvas.height = height;
   const ctx = canvas.getContext('2d');
-  ctx.save();
-  ctx.translate(width, 0);
-  ctx.scale(-1, 1);
   ctx.drawImage(video, 0, 0, width, height);
-  ctx.restore();
   ws.send(JSON.stringify({type: 'live_frame', frame: canvas.toDataURL('image/jpeg', 0.55)}));
 }
 
-function loop() {
+async function loop() {
   if (poseLandmarker && video.readyState >= 2) {
     const result = poseLandmarker.detectForVideo(video, performance.now());
-    const analyzed = analyze(result);
-    sendPresence(analyzed.present, analyzed.confidence, analyzed.parts);
-    maybeSendLiveFrame(performance.now());
+    const analyzed = await analyze(result);
+    await sendPresence(analyzed.present, analyzed.confidence, analyzed.parts);
+    setStep('stepDetect', 'done');
+    loadSteps.hidden = true;
   }
   requestAnimationFrame(loop);
 }
 
-start.onclick = () => startClient().catch((error) => {
-  console.error(error);
-  setStatus('Camera/model failed', 'bad');
-  start.disabled = false;
-  running = false;
-});
+async function resumePetSession() {
+  const res = await fetch('/api/pet/me');
+  if (!res.ok) return;
+  const payload = await res.json();
+  beginPetSession(payload.pet).catch((error) => {
+    console.error(error);
+    setStatus('Camera/model failed', 'bad');
+    setMessage(error?.message || 'Startup failed');
+    running = false;
+  });
+}
+resumePetSession();
 </script>
 """
