@@ -1,0 +1,7 @@
+# Replace catfacts.cc with your real domain before deploying if needed.
+# This Caddy service is configured for internal host ports 9000/9443,
+# so it won’t bind to the host's standard port 80 if that is in use elsewhere.
+catfacts.cc {
+    encode gzip zstd
+    reverse_proxy trainer:8000
+}

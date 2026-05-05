@@ -16,5 +16,20 @@ services:
       - ./server/audio:/data/audio:ro
     restart: unless-stopped
 
+  caddy:
+    image: caddy:latest
+    depends_on:
+      - trainer
+    ports:
+      - "9000:80"
+      - "9443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
 volumes:
   trainer-data:
+  caddy_data:
+  caddy_config:
