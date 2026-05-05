@@ -26,6 +26,8 @@ APP_NAME = "Clicker Trainer"
 ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = Path(os.environ.get("TRAINER_DB_PATH", ROOT / "server" / "trainer.sqlite3"))
 AUDIO_DIR = Path(os.environ.get("TRAINER_AUDIO_DIR", ROOT / "server" / "audio"))
+CLICK_MIN_SECONDS = 1
+CLICK_MAX_SECONDS = 6000
 TRAINER_USERNAME = os.environ.get("TRAINER_USERNAME", "trainer")
 TRAINER_PASSWORD = os.environ.get("TRAINER_PASSWORD", "trainer")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", TRAINER_PASSWORD)
@@ -376,8 +378,10 @@ class Hub:
         await self.broadcast_trainers()
 
     async def set_random_click(self, pet_id: int, enabled: bool, min_seconds: int, max_seconds: int) -> None:
-        min_seconds = max(1, min_seconds)
-        max_seconds = max(min_seconds, max_seconds)
+        min_seconds = min(CLICK_MAX_SECONDS, max(CLICK_MIN_SECONDS, min_seconds))
+        max_seconds = min(CLICK_MAX_SECONDS, max(CLICK_MIN_SECONDS, max_seconds))
+        if min_seconds > max_seconds:
+            max_seconds = min_seconds
         await self.store.set_random_click(pet_id, enabled, min_seconds, max_seconds)
         self.next_click_at.pop(pet_id, None)
         await self.store.log("random_click_updated", pet_id, {"enabled": enabled, "min_seconds": min_seconds, "max_seconds": max_seconds})
@@ -1104,8 +1108,8 @@ TRAINER_HTML = """
           <button class="secondary" id="randomOff">Disable</button>
         </div>
         <div class="row">
-          <div class="field"><label>Min seconds</label><input id="clickMin" type="number" min="1" step="1" value="30"></div>
-          <div class="field"><label>Max seconds</label><input id="clickMax" type="number" min="1" step="1" value="300"></div>
+          <div class="field"><label>Min seconds</label><input id="clickMin" type="number" min="1" max="6000" step="1" value="30"></div>
+          <div class="field"><label>Max seconds</label><input id="clickMax" type="number" min="1" max="6000" step="1" value="300"></div>
         </div>
         <div id="randomState" class="quiet"></div>
       </section>
@@ -1118,6 +1122,8 @@ TRAINER_HTML = """
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
+const CLICK_MIN_SECONDS = 1;
+const CLICK_MAX_SECONDS = 6000;
 let state = null;
 let logs = [];
 let selectedPetId = null;
@@ -1157,6 +1163,32 @@ function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 }
 function selectedPet() { return state?.pets.find((pet) => pet.id === selectedPetId) || state?.pets[0]; }
+
+function setInputUnlessFocused(id, value) {
+  const input = $(id);
+  if (document.activeElement !== input) input.value = value;
+}
+
+function clampClickSeconds(value, fallback) {
+  const parsed = Number(value);
+  const seconds = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(CLICK_MAX_SECONDS, Math.max(CLICK_MIN_SECONDS, Math.round(seconds)));
+}
+
+function normalizeClickInputs(changed = 'min') {
+  const pet = selectedPet();
+  let minSeconds = clampClickSeconds($('clickMin').value, pet?.click_min_seconds ?? 30);
+  let maxSeconds = clampClickSeconds($('clickMax').value, pet?.click_max_seconds ?? 300);
+  if (changed === 'max' && maxSeconds < minSeconds) minSeconds = maxSeconds;
+  else if (minSeconds > maxSeconds) maxSeconds = minSeconds;
+  $('clickMin').value = minSeconds;
+  $('clickMax').value = maxSeconds;
+  return {min_seconds: minSeconds, max_seconds: maxSeconds};
+}
+
+function currentClickRange() {
+  return normalizeClickInputs(document.activeElement === $('clickMax') ? 'max' : 'min');
+}
 
 function clearLiveCanvas() {
   const liveCanvas = $('liveCanvas');
@@ -1202,8 +1234,8 @@ function renderSelected() {
     ? `On${pet.stay_seconds_remaining === null ? '' : `, ${pet.stay_seconds_remaining}s remaining`}`
     : 'Off';
   $('randomState').textContent = pet.random_enabled ? `Enabled, ${pet.click_min_seconds}-${pet.click_max_seconds}s` : 'Disabled';
-  $('clickMin').value = pet.click_min_seconds;
-  $('clickMax').value = pet.click_max_seconds;
+  setInputUnlessFocused('clickMin', pet.click_min_seconds);
+  setInputUnlessFocused('clickMax', pet.click_max_seconds);
   $('liveState').textContent = pet.live_allowed
     ? (pet.live_enabled ? 'Client allowed live feed; trainer view is on.' : 'Client allowed live feed; trainer view is off.')
     : 'Client has not allowed live feed.';
@@ -1267,8 +1299,10 @@ $('liveOn').onclick = (e) => { clearLiveCanvas(); post(`/api/pets/${selectedPet(
 $('liveOff').onclick = (e) => { clearLiveCanvas(); post(`/api/pets/${selectedPet().id}/live`, {enabled: false}, e.target); };
 $('stayOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled: true, duration_seconds: Number($('stayDuration').value || 0) || null}, e.target);
 $('stayOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled: false}, e.target);
-$('randomOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/random-click`, {enabled: true, min_seconds: Number($('clickMin').value || 30), max_seconds: Number($('clickMax').value || 300)}, e.target);
-$('randomOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/random-click`, {enabled: false, min_seconds: Number($('clickMin').value || 30), max_seconds: Number($('clickMax').value || 300)}, e.target);
+$('clickMin').onchange = () => normalizeClickInputs('min');
+$('clickMax').onchange = () => normalizeClickInputs('max');
+$('randomOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/random-click`, {enabled: true, ...currentClickRange()}, e.target);
+$('randomOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/random-click`, {enabled: false, ...currentClickRange()}, e.target);
 $('copyLink').onclick = async () => { showToast(await copyTextFromInput($('petLink')) ? 'Copied' : 'Copy failed'); };
 $('logout').onclick = async () => { await fetch('/api/logout', {method: 'POST'}); location.href = '/'; };
 
