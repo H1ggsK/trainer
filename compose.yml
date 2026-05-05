@@ -1,0 +1,21 @@
+services:
+  trainer:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "9000:8000"
+    environment:
+      TRAINER_USERNAME: "${TRAINER_USERNAME:-trainer}"
+      TRAINER_PASSWORD: "${TRAINER_PASSWORD:-trainer}"
+      INITIAL_PET_CODE: "${INITIAL_PET_CODE:-pet}"
+      SESSION_SECRET: "${SESSION_SECRET:-change-this-too}"
+      TRAINER_DB_PATH: /data/trainer.sqlite3
+      TRAINER_AUDIO_DIR: /data/audio
+    volumes:
+      - trainer-data:/data
+      - ./server/audio:/data/audio:ro
+    restart: unless-stopped
+
+volumes:
+  trainer-data:

@@ -1,0 +1,14 @@
+.venv/
+venv/
+*.sqlite3
+*.db
+.env
+dist/
+build/
+*.spec
+.DS_Store
+old/
+.codex
+.agents
+**/__pycache__
+**/*.pyc
