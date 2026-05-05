@@ -1,7 +1,6 @@
-# Replace catfacts.cc with your real domain before deploying if needed.
-# This Caddy service is configured for internal host ports 9000/9443,
-# so it won’t bind to the host's standard port 80 if that is in use elsewhere.
-catfacts.cc {
+# Caddy is the only service that publishes host port 9000.
+# It proxies to the trainer app on the private Docker network.
+:80 {
     encode gzip zstd
     reverse_proxy trainer:8000
 }

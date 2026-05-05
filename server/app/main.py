@@ -558,6 +558,20 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
 
+@app.get("/api/audio/debug")
+async def audio_debug() -> dict[str, Any]:
+    files: dict[str, dict[str, Any]] = {}
+    for filename in ("beep.mp3", "click.mp3"):
+        path = AUDIO_DIR / filename
+        files[filename] = {
+            "path": str(path),
+            "exists": path.exists(),
+            "size": path.stat().st_size if path.exists() else 0,
+            "url": f"/audio/{filename}",
+        }
+    return {"audio_dir": str(AUDIO_DIR), "files": files}
+
+
 def trainer_from_cookie(cookie: str | None, role: str | None = None) -> dict[str, str] | None:
     value = unsign(cookie)
     if not value:
@@ -1290,7 +1304,6 @@ PET_HTML = """
     <p id="clientMessage" class="quiet" hidden></p>
     <div class="row">
       <label class="row"><input id="allowLive" type="checkbox"> Allow trainer live feed</label>
-      <button id="enableSound" class="secondary" type="button" hidden>Enable sound</button>
     </div>
   </section>
   <canvas id="canvas" hidden></canvas>
@@ -1310,15 +1323,9 @@ const status = document.getElementById('status');
 const stayWarning = document.getElementById('stayWarning');
 const clientMessage = document.getElementById('clientMessage');
 const allowLive = document.getElementById('allowLive');
-const enableSound = document.getElementById('enableSound');
 const canvas = document.getElementById('canvas');
 const loadSteps = document.getElementById('loadSteps');
 const loadStepIds = ['stepCamera', 'stepJs', 'stepWasm', 'stepModel', 'stepDetect'];
-const beep = new Audio('/audio/beep.mp3');
-const click = new Audio('/audio/click.mp3');
-beep.loop = true;
-beep.preload = 'auto';
-click.preload = 'auto';
 let ws = null;
 let poseLandmarker = null;
 let faceDetector = null;
@@ -1332,7 +1339,13 @@ let lastLiveAt = 0;
 let liveTimer = null;
 let cameraStream = null;
 let intentionalDisconnect = false;
-let audioUnlocked = false;
+let audioContext = null;
+let audioStartPromise = null;
+let audioReady = false;
+let audioRetryArmed = false;
+let beepBuffer = null;
+let clickBuffer = null;
+let beepSource = null;
 
 function setStatus(text, cls = '') {
   status.className = `badge ${cls}`;
@@ -1344,38 +1357,108 @@ function setMessage(text = '') {
   clientMessage.hidden = !text;
 }
 
-async function unlockAudio() {
-  if (audioUnlocked) return true;
-  enableSound.hidden = true;
-  const promises = [];
-  for (const audio of [beep, click]) {
-    const previousMuted = audio.muted;
-    const previousVolume = audio.volume;
-    audio.muted = true;
-    audio.volume = 0;
-    const attempt = audio.play();
-    if (attempt) {
-      promises.push(
-        attempt.then(() => {
-          audio.pause();
-          audio.currentTime = 0;
-          audio.muted = previousMuted;
-          audio.volume = previousVolume;
-          return true;
-        }).catch(() => {
-          audio.muted = previousMuted;
-          audio.volume = previousVolume;
-          return false;
-        })
-      );
-    }
+function logAudio(message, extra = undefined) {
+  if (extra === undefined) console.info(`[audio] ${message}`);
+  else console.info(`[audio] ${message}`, extra);
+}
+
+function armAudioRetry() {
+  if (audioRetryArmed) return;
+  audioRetryArmed = true;
+  const retry = () => {
+    document.removeEventListener('pointerdown', retry);
+    document.removeEventListener('keydown', retry);
+    audioRetryArmed = false;
+    ensureAudioStarted().then(() => updateBeep(lastPresent));
+  };
+  document.addEventListener('pointerdown', retry, {once: true});
+  document.addEventListener('keydown', retry, {once: true});
+}
+
+async function fetchAudioBuffer(name) {
+  const url = `/audio/${name}.mp3`;
+  logAudio(`fetching ${url}`);
+  const response = await fetch(url, {cache: 'reload'});
+  if (!response.ok) throw new Error(`${url} returned HTTP ${response.status}`);
+  const buffer = await response.arrayBuffer();
+  if (!buffer.byteLength) throw new Error(`${url} was empty`);
+  return await audioContext.decodeAudioData(buffer);
+}
+
+async function ensureAudioStarted() {
+  if (audioReady) return true;
+  if (audioStartPromise) return audioStartPromise;
+  audioStartPromise = (async () => {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) throw new Error('Web Audio is not supported in this browser');
+    audioContext = audioContext || new AudioContextClass();
+    await audioContext.resume();
+    logAudio(`context state after resume: ${audioContext.state}`);
+    const debugPromise = fetch('/api/audio/debug')
+      .then((response) => response.ok ? response.json() : {ok: false, status: response.status})
+      .catch((error) => ({error: String(error)}));
+    const [debug, decodedBeep, decodedClick] = await Promise.all([
+      debugPromise,
+      fetchAudioBuffer('beep'),
+      fetchAudioBuffer('click'),
+    ]);
+    logAudio('server debug', debug);
+    beepBuffer = decodedBeep;
+    clickBuffer = decodedClick;
+    audioReady = true;
+    return true;
+  })().catch((error) => {
+    audioStartPromise = null;
+    audioReady = false;
+    console.error('[audio] startup failed', error);
+    setMessage(`Audio failed: ${error?.message || error}`);
+    armAudioRetry();
+    return false;
+  });
+  return audioStartPromise;
+}
+
+async function playClick() {
+  if (!await ensureAudioStarted()) return;
+  if (audioContext.state !== 'running') await audioContext.resume();
+  if (audioContext.state !== 'running') {
+    setMessage('Audio is blocked until this page is clicked or tapped once.');
+    armAudioRetry();
+    return;
   }
-  const results = await Promise.all(promises);
-  audioUnlocked = results.every(result => result);
-  if (!audioUnlocked) {
-    enableSound.hidden = false;
+  const source = audioContext.createBufferSource();
+  source.buffer = clickBuffer;
+  source.connect(audioContext.destination);
+  source.start();
+}
+
+async function startBeep() {
+  if (beepSource) return;
+  if (!await ensureAudioStarted()) return;
+  if (audioContext.state !== 'running') await audioContext.resume();
+  if (audioContext.state !== 'running') {
+    setMessage('Audio is blocked until this page is clicked or tapped once.');
+    armAudioRetry();
+    return;
   }
-  return audioUnlocked;
+  beepSource = audioContext.createBufferSource();
+  beepSource.buffer = beepBuffer;
+  beepSource.loop = true;
+  beepSource.connect(audioContext.destination);
+  beepSource.onended = () => {
+    beepSource = null;
+  };
+  beepSource.start();
+}
+
+function stopBeep() {
+  if (!beepSource) return;
+  const source = beepSource;
+  beepSource = null;
+  try {
+    source.stop();
+  } catch (_) {}
+  source.disconnect();
 }
 
 function setStep(id, state) {
@@ -1392,18 +1475,17 @@ function resetSteps() {
   for (const id of loadStepIds) setStep(id, 'idle');
 }
 
-async function beginPetSession(pet) {
+async function beginPetSession(pet, audioStart = null) {
   intentionalDisconnect = false;
   petName.textContent = pet.name;
   codePanel.hidden = true;
   clientPanel.hidden = false;
-  enableSound.hidden = audioUnlocked;
   resetSteps();
-  await startClient();
+  await startClient(audioStart);
 }
 
 async function submitPetCode() {
-  await unlockAudio();
+  const audioStart = ensureAudioStarted();
   loginPet.disabled = true;
   loginPet.textContent = 'Checking...';
   loginError.textContent = '';
@@ -1419,7 +1501,7 @@ async function submitPetCode() {
     return;
   }
   const payload = await res.json();
-  beginPetSession(payload.pet).catch((error) => {
+  beginPetSession(payload.pet, audioStart).catch((error) => {
     console.error(error);
     for (const id of loadStepIds) {
       const item = document.getElementById(id);
@@ -1451,6 +1533,7 @@ leavePet.onclick = async () => {
   lastPresent = null;
   lastParts = '';
   stayEnabled = false;
+  stopBeep();
   stayWarning.hidden = true;
   clientPanel.hidden = true;
   codePanel.hidden = false;
@@ -1464,11 +1547,6 @@ allowLive.onchange = () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({type: 'live_allowed', allowed: allowLive.checked}));
   }
-};
-
-enableSound.onclick = async () => {
-  await unlockAudio();
-  setTimeout(async () => await updateBeep(lastPresent), 150);
 };
 
 function connectWs() {
@@ -1488,9 +1566,7 @@ function connectWs() {
       await updateBeep(lastPresent);
     }
     if (message.type === 'play_click') {
-      if (!audioUnlocked) await unlockAudio();
-      click.currentTime = 0;
-      await click.play().catch((error) => setMessage(`Click sound blocked: ${error.message || error}`));
+      await playClick();
     }
     if (message.type === 'live_request') {
       liveRequested = Boolean(message.enabled);
@@ -1501,11 +1577,9 @@ function connectWs() {
 
 async function updateBeep(present) {
   if (stayEnabled && present === false) {
-    if (!audioUnlocked) await unlockAudio();
-    beep.play().catch((error) => setMessage(`Beep sound blocked: ${error.message || error}`));
+    await startBeep();
   } else {
-    beep.pause();
-    beep.currentTime = 0;
+    stopBeep();
   }
 }
 
@@ -1582,10 +1656,11 @@ async function initPose() {
   }
 }
 
-async function startClient() {
+async function startClient(audioStart = null) {
   if (running) return;
   running = true;
   setMessage('');
+  const audioPromise = audioStart || ensureAudioStarted();
   setStatus('Requesting camera');
   setStep('stepCamera', 'active');
   const stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: 'user'}, audio: false});
@@ -1593,6 +1668,9 @@ async function startClient() {
   setStep('stepCamera', 'done');
   video.srcObject = stream;
   await video.play();
+  audioPromise.then((ok) => {
+    if (ok) logAudio('ready');
+  });
   connectWs();
   await initPose();
   setStep('stepDetect', 'active');
