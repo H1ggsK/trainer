@@ -1612,6 +1612,7 @@ const CLICK_MAX_SECONDS = 6000;
 let state = null;
 let logs = [];
 let recordings = [];
+let recordingsSignature = '';
 let selectedPetId = null;
 let liveFramePetId = null;
 let clickRangeDirty = false;
@@ -1693,24 +1694,41 @@ function markSettingDirty(key) {
   settingsDirty.add(key);
 }
 
-function clearSettingDirty(...keys) {
-  for (const key of keys) settingsDirty.delete(key);
-}
-
 function syncSettingInput(id, value, key, petId) {
   ensureSettingsPet(petId);
-  if (!settingsDirty.has(key)) $(id).value = value;
+  const input = $(id);
+  if (settingsDirty.has(key)) {
+    if (String(input.value).toLowerCase() === String(value).toLowerCase()) settingsDirty.delete(key);
+    return;
+  }
+  input.value = value;
 }
 
 function syncSettingCheckbox(id, value, key, petId) {
   ensureSettingsPet(petId);
-  if (!settingsDirty.has(key)) $(id).checked = Boolean(value);
+  const input = $(id);
+  if (settingsDirty.has(key)) {
+    if (input.checked === Boolean(value)) settingsDirty.delete(key);
+    return;
+  }
+  input.checked = Boolean(value);
 }
 
 function clampSeconds(value, fallback, min, max) {
   const parsed = Number(value);
   const seconds = Number.isFinite(parsed) ? parsed : fallback;
   return Math.min(max, Math.max(min, Math.round(seconds)));
+}
+
+function formatDuration(seconds) {
+  seconds = Math.max(0, Math.ceil(Number(seconds) || 0));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return minutes ? `${minutes}m ${String(remainder).padStart(2, '0')}s` : `${remainder}s`;
+}
+
+function secondsUntil(epochSeconds) {
+  return Math.max(0, Number(epochSeconds || 0) - Date.now() / 1000);
 }
 
 function markClickRangeDirty(changed) {
@@ -1740,12 +1758,15 @@ async function saveRandomClick(enabled, button) {
 }
 
 async function saveBreaks(enabled, button) {
-  const result = await post(`/api/pets/${selectedPet().id}/breaks`, {
+  const intervalSeconds = clampSeconds($('breakInterval').value, 1800, 60, 86400);
+  const durationSeconds = clampSeconds($('breakDuration').value, 300, 30, 3600);
+  $('breakInterval').value = intervalSeconds;
+  $('breakDuration').value = durationSeconds;
+  await post(`/api/pets/${selectedPet().id}/breaks`, {
     enabled,
-    interval_seconds: clampSeconds($('breakInterval').value, 1800, 60, 86400),
-    duration_seconds: clampSeconds($('breakDuration').value, 300, 30, 3600)
+    interval_seconds: intervalSeconds,
+    duration_seconds: durationSeconds
   }, button);
-  if (result) clearSettingDirty('breakInterval', 'breakDuration');
 }
 
 async function saveBark(enabled, button) {
@@ -1754,7 +1775,7 @@ async function saveBark(enabled, button) {
   if (minSeconds > maxSeconds) maxSeconds = minSeconds;
   $('barkMin').value = minSeconds;
   $('barkMax').value = maxSeconds;
-  const result = await post(`/api/pets/${selectedPet().id}/bark`, {
+  await post(`/api/pets/${selectedPet().id}/bark`, {
     enabled,
     min_seconds: minSeconds,
     max_seconds: maxSeconds,
@@ -1762,7 +1783,6 @@ async function saveBark(enabled, button) {
     record_seconds: clampSeconds($('barkRecordSeconds').value, 10, 1, 60),
     record_enabled: $('barkRecordEnabled').checked
   }, button);
-  if (result) clearSettingDirty('barkMin', 'barkMax', 'barkResponse', 'barkRecordSeconds', 'barkRecordEnabled');
 }
 
 function clearLiveCanvas() {
@@ -1818,8 +1838,8 @@ function renderSelected() {
   syncSettingInput('breakDuration', pet.break_duration_seconds, 'breakDuration', pet.id);
   syncSettingInput('censorColor', pet.censor_color || '#000000', 'censorColor', pet.id);
   if (pet.break_overdue) $('breakState').textContent = 'Break overdue';
-  else if (pet.break_until) $('breakState').textContent = `On break until ${new Date(pet.break_until * 1000).toLocaleTimeString()}`;
-  else if (pet.break_due_at) $('breakState').textContent = `Next break around ${new Date(pet.break_due_at * 1000).toLocaleTimeString()}`;
+  else if (pet.break_until) $('breakState').textContent = `On break, ${formatDuration(secondsUntil(pet.break_until))} remaining`;
+  else if (pet.break_due_at) $('breakState').textContent = `Next break available in ${formatDuration(secondsUntil(pet.break_due_at))}`;
   else $('breakState').textContent = pet.break_enabled ? 'Enabled' : 'Disabled';
   syncSettingInput('barkMin', pet.bark_min_seconds, 'barkMin', pet.id);
   syncSettingInput('barkMax', pet.bark_max_seconds, 'barkMax', pet.id);
@@ -1836,6 +1856,9 @@ function renderSelected() {
 }
 
 function renderRecordings() {
+  const signature = recordings.map((recording) => `${recording.id}:${recording.size_bytes}`).join('|');
+  if (signature === recordingsSignature) return;
+  recordingsSignature = signature;
   $('recordings').innerHTML = recordings.map((recording) => `
     <div class="item">
       <strong>${esc(recording.pet_name || 'Pet')}</strong>
@@ -1910,16 +1933,18 @@ $('stayOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled
 $('stayOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled: false}, e.target);
 $('kneelOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/kneel`, {enabled: true}, e.target);
 $('kneelOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/kneel`, {enabled: false}, e.target);
-$('breakInterval').oninput = () => markSettingDirty('breakInterval');
-$('breakDuration').oninput = () => markSettingDirty('breakDuration');
+for (const id of ['breakInterval', 'breakDuration']) {
+  $(id).onfocus = () => markSettingDirty(id);
+  $(id).oninput = () => markSettingDirty(id);
+  $(id).onchange = () => markSettingDirty(id);
+}
 $('censorColor').oninput = () => markSettingDirty('censorColor');
 $('breakOn').onclick = (e) => saveBreaks(true, e.target);
 $('breakOff').onclick = (e) => saveBreaks(false, e.target);
 $('breakStart').onclick = (e) => post(`/api/pets/${selectedPet().id}/break-state`, {active: true}, e.target);
 $('breakStop').onclick = (e) => post(`/api/pets/${selectedPet().id}/break-state`, {active: false}, e.target);
 $('saveCensor').onclick = async (e) => {
-  const result = await post(`/api/pets/${selectedPet().id}/censor`, {color: $('censorColor').value}, e.target);
-  if (result) clearSettingDirty('censorColor');
+  await post(`/api/pets/${selectedPet().id}/censor`, {color: $('censorColor').value}, e.target);
 };
 $('clickMin').oninput = () => markClickRangeDirty('min');
 $('clickMax').oninput = () => markClickRangeDirty('max');
@@ -1997,7 +2022,8 @@ PET_HTML = """
     <div class="row">
       <label class="row"><input id="allowLive" type="checkbox"> Allow trainer live feed</label>
       <label class="row"><input id="censorFaces" type="checkbox" checked> Censor faces</label>
-      <button id="breakButton" class="secondary" type="button" hidden>Start Break</button>
+      <button id="breakStartButton" class="secondary" type="button" disabled>Start Break</button>
+      <button id="breakStopButton" class="secondary" type="button" disabled>End Break</button>
       <span id="breakStatus" class="quiet"></span>
     </div>
   </section>
@@ -2021,7 +2047,8 @@ const kneelWarning = document.getElementById('kneelWarning');
 const clientMessage = document.getElementById('clientMessage');
 const allowLive = document.getElementById('allowLive');
 const censorFaces = document.getElementById('censorFaces');
-const breakButton = document.getElementById('breakButton');
+const breakStartButton = document.getElementById('breakStartButton');
+const breakStopButton = document.getElementById('breakStopButton');
 const breakStatus = document.getElementById('breakStatus');
 const canvas = document.getElementById('canvas');
 const loadSteps = document.getElementById('loadSteps');
@@ -2035,6 +2062,7 @@ let lastKneeling = null;
 let breakEnabled = false;
 let breakActive = false;
 let breakOverdue = false;
+let breakDueAt = null;
 let breakUntil = null;
 let barkPendingUntil = 0;
 let barkRecordSeconds = 10;
@@ -2070,6 +2098,31 @@ function setStatus(text, cls = '') {
 function setMessage(text = '') {
   clientMessage.textContent = text;
   clientMessage.hidden = !text;
+}
+
+function formatDuration(seconds) {
+  seconds = Math.max(0, Math.ceil(Number(seconds) || 0));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return minutes ? `${minutes}m ${String(remainder).padStart(2, '0')}s` : `${remainder}s`;
+}
+
+function secondsUntil(epochSeconds) {
+  return Math.max(0, Number(epochSeconds || 0) - Date.now() / 1000);
+}
+
+function updateBreakStatus() {
+  if (!breakEnabled) {
+    breakStatus.textContent = 'Breaks disabled';
+  } else if (breakOverdue) {
+    breakStatus.textContent = 'Break overdue';
+  } else if (breakActive) {
+    breakStatus.textContent = `${formatDuration(secondsUntil(breakUntil))} left`;
+  } else if (breakDueAt) {
+    breakStatus.textContent = `Next break in ${formatDuration(secondsUntil(breakDueAt))}`;
+  } else {
+    breakStatus.textContent = 'Break available';
+  }
 }
 
 function logAudio(message, extra = undefined) {
@@ -2370,11 +2423,14 @@ leavePet.onclick = async () => {
   breakEnabled = false;
   breakActive = false;
   breakOverdue = false;
+  breakDueAt = null;
+  breakUntil = null;
   if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
   stopBeep();
   stayWarning.hidden = true;
   kneelWarning.hidden = true;
-  breakButton.hidden = true;
+  breakStartButton.disabled = true;
+  breakStopButton.disabled = true;
   breakStatus.textContent = '';
   clientPanel.hidden = true;
   codePanel.hidden = false;
@@ -2393,9 +2449,14 @@ allowLive.onchange = () => {
   }
 };
 
-breakButton.onclick = () => {
+breakStartButton.onclick = () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({type: 'break', state: breakActive ? 'stop' : 'start'}));
+  ws.send(JSON.stringify({type: 'break', state: 'start'}));
+};
+
+breakStopButton.onclick = () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({type: 'break', state: 'stop'}));
 };
 
 function connectWs() {
@@ -2413,15 +2474,16 @@ function connectWs() {
       stayEnabled = Boolean(message.settings.stay_in_frame_enabled);
       kneelEnabled = Boolean(message.settings.kneel_enabled);
       breakEnabled = Boolean(message.settings.break_enabled);
+      breakDueAt = message.settings.break_due_at || null;
       breakUntil = message.settings.break_until || null;
       breakActive = Boolean(breakUntil);
       breakOverdue = Boolean(message.settings.break_overdue);
       censorColor = message.settings.censor_color || '#000000';
       stayWarning.hidden = !stayEnabled;
       kneelWarning.hidden = !kneelEnabled;
-      breakButton.hidden = !breakEnabled;
-      breakButton.textContent = breakActive ? 'End Break' : 'Start Break';
-      breakStatus.textContent = breakOverdue ? 'Break overdue' : breakActive ? 'On break' : '';
+      breakStartButton.disabled = !breakEnabled || breakActive;
+      breakStopButton.disabled = !breakEnabled || !breakActive;
+      updateBreakStatus();
       await updateBeep();
     }
     if (message.type === 'play_click') {
@@ -2690,6 +2752,7 @@ async function maybeSendLiveFrame(now) {
 }
 
 async function loop() {
+  updateBreakStatus();
   if (poseLandmarker && video.readyState >= 2) {
     const result = poseLandmarker.detectForVideo(video, performance.now());
     const analyzed = await analyze(result);
