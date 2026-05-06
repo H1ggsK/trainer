@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server ./server
 COPY common ./common
 
-RUN mkdir -p /data/audio
+RUN mkdir -p /data/audio /data/recordings
 VOLUME ["/data"]
 
 EXPOSE 8000

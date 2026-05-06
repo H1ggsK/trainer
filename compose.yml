@@ -12,6 +12,7 @@ services:
       TRAINER_PUBLIC_URL: "${TRAINER_PUBLIC_URL:-https://training.catfacts.cc}"
       TRAINER_DB_PATH: /data/trainer.sqlite3
       TRAINER_AUDIO_DIR: /data/audio
+      TRAINER_RECORDING_DIR: /data/recordings
     volumes:
       - trainer-data:/data
       - ./server/audio:/data/audio:ro

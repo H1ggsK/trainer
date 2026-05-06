@@ -6,7 +6,7 @@ The server runs a password-protected trainer panel, stores event logs in SQLite,
 
 ## Versioning
 
-Server and browser client both advertise `PROTOCOL_VERSION = "1.0.0"`. They must share the same major protocol version or the connection is rejected.
+Server and browser client both advertise `PROTOCOL_VERSION = "1.1.0"`. They must share the same major protocol version or the connection is rejected.
 
 ## Server
 
@@ -102,3 +102,4 @@ Fresh databases start with no pets. A trainer must add each pet and code from th
 - Multiple trainers, with admin-managed trainer accounts
 - Optional client-approved live feed view
 - SQLite persistence for logs and settings
+- V1.1 kneel checks, configurable pet breaks, bark prompts, optional bark recordings, face censoring for shared feed frames, and log clearing

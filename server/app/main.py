@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from common.protocol import PROTOCOL_VERSION, compatible
@@ -26,8 +26,10 @@ APP_NAME = "Clicker Trainer"
 ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = Path(os.environ.get("TRAINER_DB_PATH", ROOT / "server" / "trainer.sqlite3"))
 AUDIO_DIR = Path(os.environ.get("TRAINER_AUDIO_DIR", ROOT / "server" / "audio"))
+RECORDING_DIR = Path(os.environ.get("TRAINER_RECORDING_DIR", ROOT / "server" / "recordings"))
 CLICK_MIN_SECONDS = 1
 CLICK_MAX_SECONDS = 6000
+BARK_MAX_SECONDS = 6000
 TRAINER_USERNAME = os.environ.get("TRAINER_USERNAME", "trainer")
 TRAINER_PASSWORD = os.environ.get("TRAINER_PASSWORD", "trainer")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", TRAINER_PASSWORD)
@@ -118,6 +120,16 @@ class Store:
                     random_enabled INTEGER NOT NULL DEFAULT 0,
                     click_min_seconds INTEGER NOT NULL DEFAULT 30,
                     click_max_seconds INTEGER NOT NULL DEFAULT 300,
+                    kneel_enabled INTEGER NOT NULL DEFAULT 0,
+                    break_enabled INTEGER NOT NULL DEFAULT 0,
+                    break_interval_seconds INTEGER NOT NULL DEFAULT 1800,
+                    break_duration_seconds INTEGER NOT NULL DEFAULT 300,
+                    bark_enabled INTEGER NOT NULL DEFAULT 0,
+                    bark_min_seconds INTEGER NOT NULL DEFAULT 30,
+                    bark_max_seconds INTEGER NOT NULL DEFAULT 300,
+                    bark_response_seconds INTEGER NOT NULL DEFAULT 5,
+                    bark_record_seconds INTEGER NOT NULL DEFAULT 10,
+                    bark_record_enabled INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS logs (
@@ -127,8 +139,36 @@ class Store:
                     event TEXT NOT NULL,
                     detail TEXT NOT NULL DEFAULT '{}'
                 );
+                CREATE TABLE IF NOT EXISTS bark_recordings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pet_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    duration_seconds INTEGER NOT NULL,
+                    size_bytes INTEGER NOT NULL
+                );
                 """
             )
+            pet_columns = {
+                row["name"]
+                for row in self.connection.execute("PRAGMA table_info(pets)").fetchall()
+            }
+            pet_defaults = {
+                "kneel_enabled": "INTEGER NOT NULL DEFAULT 0",
+                "break_enabled": "INTEGER NOT NULL DEFAULT 0",
+                "break_interval_seconds": "INTEGER NOT NULL DEFAULT 1800",
+                "break_duration_seconds": "INTEGER NOT NULL DEFAULT 300",
+                "bark_enabled": "INTEGER NOT NULL DEFAULT 0",
+                "bark_min_seconds": "INTEGER NOT NULL DEFAULT 30",
+                "bark_max_seconds": "INTEGER NOT NULL DEFAULT 300",
+                "bark_response_seconds": "INTEGER NOT NULL DEFAULT 5",
+                "bark_record_seconds": "INTEGER NOT NULL DEFAULT 10",
+                "bark_record_enabled": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column, definition in pet_defaults.items():
+                if column not in pet_columns:
+                    self.connection.execute(f"ALTER TABLE pets ADD COLUMN {column} {definition}")
             log_columns = {
                 row["name"]
                 for row in self.connection.execute("PRAGMA table_info(logs)").fetchall()
@@ -260,6 +300,77 @@ class Store:
             )
             self.connection.commit()
 
+    async def set_kneel(self, pet_id: int, enabled: bool) -> None:
+        async with self.lock:
+            self.connection.execute(
+                "UPDATE pets SET kneel_enabled = ? WHERE id = ?",
+                (1 if enabled else 0, pet_id),
+            )
+            self.connection.commit()
+
+    async def set_breaks(self, pet_id: int, enabled: bool, interval_seconds: int, duration_seconds: int) -> None:
+        async with self.lock:
+            self.connection.execute(
+                "UPDATE pets SET break_enabled = ?, break_interval_seconds = ?, break_duration_seconds = ? WHERE id = ?",
+                (1 if enabled else 0, interval_seconds, duration_seconds, pet_id),
+            )
+            self.connection.commit()
+
+    async def set_bark(self, pet_id: int, enabled: bool, min_seconds: int, max_seconds: int, response_seconds: int, record_seconds: int, record_enabled: bool) -> None:
+        async with self.lock:
+            self.connection.execute(
+                """
+                UPDATE pets
+                SET bark_enabled = ?, bark_min_seconds = ?, bark_max_seconds = ?,
+                    bark_response_seconds = ?, bark_record_seconds = ?, bark_record_enabled = ?
+                WHERE id = ?
+                """,
+                (1 if enabled else 0, min_seconds, max_seconds, response_seconds, record_seconds, 1 if record_enabled else 0, pet_id),
+            )
+            self.connection.commit()
+
+    async def add_recording(self, pet_id: int, filename: str, content_type: str, duration_seconds: int, size_bytes: int) -> int:
+        async with self.lock:
+            cursor = self.connection.execute(
+                "INSERT INTO bark_recordings(pet_id, created_at, filename, content_type, duration_seconds, size_bytes) VALUES(?, ?, ?, ?, ?, ?)",
+                (pet_id, now_iso(), filename, content_type, duration_seconds, size_bytes),
+            )
+            self.connection.commit()
+            return int(cursor.lastrowid)
+
+    async def list_recordings(self, limit: int = 80) -> list[dict[str, Any]]:
+        async with self.lock:
+            rows = self.connection.execute(
+                """
+                SELECT bark_recordings.*, pets.name AS pet_name
+                FROM bark_recordings
+                LEFT JOIN pets ON pets.id = bark_recordings.pet_id
+                ORDER BY bark_recordings.id DESC
+                LIMIT ?
+                """,
+                (min(max(limit, 1), 300),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_recording(self, recording_id: int) -> dict[str, Any] | None:
+        async with self.lock:
+            row = self.connection.execute("SELECT * FROM bark_recordings WHERE id = ?", (recording_id,)).fetchone()
+        return dict(row) if row else None
+
+    async def delete_recording(self, recording_id: int) -> dict[str, Any] | None:
+        recording = await self.get_recording(recording_id)
+        if not recording:
+            return None
+        async with self.lock:
+            self.connection.execute("DELETE FROM bark_recordings WHERE id = ?", (recording_id,))
+            self.connection.commit()
+        return recording
+
+    async def clear_logs(self) -> None:
+        async with self.lock:
+            self.connection.execute("DELETE FROM logs")
+            self.connection.commit()
+
     async def log(self, event: str, pet_id: int | None = None, detail: dict[str, Any] | None = None) -> None:
         async with self.lock:
             self.connection.execute(
@@ -308,6 +419,16 @@ class Store:
             "random_enabled": bool(row["random_enabled"]),
             "click_min_seconds": row["click_min_seconds"],
             "click_max_seconds": row["click_max_seconds"],
+            "kneel_enabled": bool(row["kneel_enabled"]),
+            "break_enabled": bool(row["break_enabled"]),
+            "break_interval_seconds": row["break_interval_seconds"],
+            "break_duration_seconds": row["break_duration_seconds"],
+            "bark_enabled": bool(row["bark_enabled"]),
+            "bark_min_seconds": row["bark_min_seconds"],
+            "bark_max_seconds": row["bark_max_seconds"],
+            "bark_response_seconds": row["bark_response_seconds"],
+            "bark_record_seconds": row["bark_record_seconds"],
+            "bark_record_enabled": bool(row["bark_record_enabled"]),
             "created_at": row["created_at"],
         }
 
@@ -319,11 +440,18 @@ class Hub:
         self.client_pet: dict[WebSocket, int] = {}
         self.trainers: set[WebSocket] = set()
         self.presence: dict[int, bool | None] = {}
+        self.kneeling: dict[int, bool | None] = {}
         self.parts: dict[int, list[str]] = {}
         self.connected_at: dict[int, str] = {}
         self.live_allowed: dict[int, bool] = {}
         self.live_enabled: dict[int, bool] = {}
         self.next_click_at: dict[int, float] = {}
+        self.break_due_at: dict[int, float] = {}
+        self.break_started_at: dict[int, float] = {}
+        self.break_until: dict[int, float] = {}
+        self.break_overdue: dict[int, bool] = {}
+        self.next_bark_at: dict[int, float] = {}
+        self.bark_pending_until: dict[int, float] = {}
         self.lock = asyncio.Lock()
         self._random_task: asyncio.Task[None] | None = None
         self._timer_task: asyncio.Task[None] | None = None
@@ -343,7 +471,11 @@ class Hub:
             self.client_pet[websocket] = pet_id
             self.connected_at[pet_id] = now_iso()
             self.presence.setdefault(pet_id, None)
+            self.kneeling.setdefault(pet_id, None)
             self.parts.setdefault(pet_id, [])
+            pet = await self.store.get_pet(pet_id)
+            if pet and pet["break_enabled"]:
+                self.break_due_at.setdefault(pet_id, time.time() + pet["break_interval_seconds"])
         await self.store.log("pet_connected", pet_id, {"clients": len(self.clients.get(pet_id, []))})
         await websocket.send_json({"type": "hello", "protocol_version": PROTOCOL_VERSION})
         await self.send_pet_settings(websocket, pet_id)
@@ -358,9 +490,16 @@ class Hub:
             if not self.clients.get(pet_id):
                 self.clients.pop(pet_id, None)
                 self.presence[pet_id] = None
+                self.kneeling[pet_id] = None
                 self.parts[pet_id] = []
                 self.connected_at.pop(pet_id, None)
                 self.live_enabled[pet_id] = False
+                self.break_due_at.pop(pet_id, None)
+                self.break_started_at.pop(pet_id, None)
+                self.break_until.pop(pet_id, None)
+                self.break_overdue.pop(pet_id, None)
+                self.next_bark_at.pop(pet_id, None)
+                self.bark_pending_until.pop(pet_id, None)
         await self.store.log("pet_disconnected", pet_id, {})
         await self.broadcast_trainers()
 
@@ -387,18 +526,128 @@ class Hub:
         await self.store.log("random_click_updated", pet_id, {"enabled": enabled, "min_seconds": min_seconds, "max_seconds": max_seconds})
         await self.broadcast_trainers()
 
+    async def set_kneel(self, pet_id: int, enabled: bool) -> None:
+        await self.store.set_kneel(pet_id, enabled)
+        await self.store.log("kneel_check_updated", pet_id, {"enabled": enabled})
+        await self.broadcast_pet_settings(pet_id)
+        await self.broadcast_trainers()
+
+    async def set_breaks(self, pet_id: int, enabled: bool, interval_seconds: int, duration_seconds: int) -> None:
+        interval_seconds = min(24 * 60 * 60, max(60, interval_seconds))
+        duration_seconds = min(60 * 60, max(30, duration_seconds))
+        await self.store.set_breaks(pet_id, enabled, interval_seconds, duration_seconds)
+        now = time.time()
+        if enabled:
+            self.break_due_at[pet_id] = now + interval_seconds
+        else:
+            self.break_due_at.pop(pet_id, None)
+            self.break_started_at.pop(pet_id, None)
+            self.break_until.pop(pet_id, None)
+            self.break_overdue.pop(pet_id, None)
+        await self.store.log("breaks_updated", pet_id, {"enabled": enabled, "interval_seconds": interval_seconds, "duration_seconds": duration_seconds})
+        await self.broadcast_pet_settings(pet_id)
+        await self.broadcast_trainers()
+
+    async def set_bark(self, pet_id: int, enabled: bool, min_seconds: int, max_seconds: int, response_seconds: int, record_seconds: int, record_enabled: bool) -> None:
+        min_seconds = min(BARK_MAX_SECONDS, max(1, min_seconds))
+        max_seconds = min(BARK_MAX_SECONDS, max(1, max_seconds))
+        if min_seconds > max_seconds:
+            max_seconds = min_seconds
+        response_seconds = min(60, max(1, response_seconds))
+        record_seconds = min(60, max(1, record_seconds))
+        await self.store.set_bark(pet_id, enabled, min_seconds, max_seconds, response_seconds, record_seconds, record_enabled)
+        self.next_bark_at.pop(pet_id, None)
+        self.bark_pending_until.pop(pet_id, None)
+        await self.store.log("bark_check_updated", pet_id, {
+            "enabled": enabled,
+            "min_seconds": min_seconds,
+            "max_seconds": max_seconds,
+            "response_seconds": response_seconds,
+            "record_seconds": record_seconds,
+            "record_enabled": record_enabled,
+        })
+        await self.broadcast_pet_settings(pet_id)
+        await self.broadcast_trainers()
+
     async def manual_click(self, pet_id: int) -> None:
         await self.store.log("manual_click", pet_id, {})
         await self.broadcast_clients(pet_id, {"type": "play_click", "source": "manual"})
         await self.broadcast_trainers()
 
-    async def update_presence(self, pet_id: int, present: bool, confidence: float | None, parts: list[str]) -> None:
+    async def trigger_speak(self, pet_id: int, source: str = "manual") -> None:
+        pet = await self.store.get_pet(pet_id)
+        if not pet:
+            return
+        self.bark_pending_until[pet_id] = time.time() + pet["bark_response_seconds"]
+        await self.store.log("speak_prompt", pet_id, {"source": source, "response_seconds": pet["bark_response_seconds"]})
+        await self.broadcast_clients(pet_id, {
+            "type": "speak",
+            "response_seconds": pet["bark_response_seconds"],
+            "record_seconds": pet["bark_record_seconds"],
+            "record_enabled": pet["bark_record_enabled"],
+        })
+        await self.broadcast_trainers()
+
+    async def update_presence(self, pet_id: int, present: bool, confidence: float | None, parts: list[str], kneeling: bool | None = None) -> None:
         previous = self.presence.get(pet_id)
         self.presence[pet_id] = present
         self.parts[pet_id] = parts
         if previous != present:
             event = "pet_returned" if present else "pet_left_frame"
             await self.store.log(event, pet_id, {"confidence": confidence, "parts": parts})
+        previous_kneeling = self.kneeling.get(pet_id)
+        if kneeling is not None:
+            self.kneeling[pet_id] = kneeling
+            if previous_kneeling != kneeling:
+                await self.store.log("pet_knelt" if kneeling else "pet_not_kneeling", pet_id, {"confidence": confidence})
+        await self.broadcast_trainers()
+
+    async def set_break_state(self, pet_id: int, active: bool) -> None:
+        pet = await self.store.get_pet(pet_id)
+        if not pet or not pet["break_enabled"]:
+            return
+        now = time.time()
+        if active:
+            self.break_started_at[pet_id] = now
+            self.break_until[pet_id] = now + pet["break_duration_seconds"]
+            self.break_overdue[pet_id] = False
+            await self.store.log("break_started", pet_id, {"duration_seconds": pet["break_duration_seconds"]})
+        else:
+            self.break_started_at.pop(pet_id, None)
+            self.break_until.pop(pet_id, None)
+            self.break_overdue.pop(pet_id, None)
+            self.break_due_at[pet_id] = now + pet["break_interval_seconds"]
+            await self.store.log("break_ended", pet_id, {})
+        await self.broadcast_pet_settings(pet_id)
+        await self.broadcast_trainers()
+
+    async def handle_bark_noise(self, pet_id: int, level: float) -> None:
+        pending_until = self.bark_pending_until.get(pet_id)
+        if not pending_until or time.time() > pending_until:
+            return
+        self.bark_pending_until.pop(pet_id, None)
+        await self.store.log("bark_detected", pet_id, {"level": level})
+        await self.broadcast_trainers()
+
+    async def save_bark_recording(self, pet_id: int, data_url: str, duration_seconds: int) -> None:
+        if "," not in data_url:
+            return
+        header, encoded = data_url.split(",", 1)
+        content_type = "audio/webm"
+        if header.startswith("data:") and ";" in header:
+            content_type = header[5:].split(";", 1)[0] or content_type
+        try:
+            blob = base64.b64decode(encoded, validate=True)
+        except Exception:
+            return
+        if not blob or len(blob) > 5_000_000:
+            return
+        RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+        filename = f"bark-{pet_id}-{int(time.time())}-{secrets.token_hex(4)}.webm"
+        path = RECORDING_DIR / filename
+        path.write_bytes(blob)
+        recording_id = await self.store.add_recording(pet_id, filename, content_type, duration_seconds, len(blob))
+        await self.store.log("bark_recording_saved", pet_id, {"recording_id": recording_id, "size_bytes": len(blob)})
         await self.broadcast_trainers()
 
     async def set_live_allowed(self, pet_id: int, allowed: bool) -> None:
@@ -435,10 +684,12 @@ class Hub:
         role = me.get("role") if me else None
         pets: list[dict[str, Any]] = []
         trainers: list[dict[str, Any]] = []
+        recordings: list[dict[str, Any]] = []
         if role == "trainer":
             pets = await self.store.list_pets()
             await self._expire_stay_if_needed(pets)
             pets = await self.store.list_pets()
+            recordings = await self.store.list_recordings()
         elif role == "admin":
             trainers = await self.store.list_trainers()
         return {
@@ -446,6 +697,7 @@ class Hub:
             "me": me,
             "pets": [self._public_pet(pet) for pet in pets],
             "trainers": trainers,
+            "recordings": recordings,
             "audio": {
                 "beep_exists": (AUDIO_DIR / "beep.mp3").exists(),
                 "click_exists": (AUDIO_DIR / "click.mp3").exists(),
@@ -486,7 +738,19 @@ class Hub:
             await self.unregister_client(client)
 
     def _client_settings(self, pet: dict[str, Any]) -> dict[str, Any]:
-        return {"stay_in_frame_enabled": self._stay_active(pet)}
+        break_until = self.break_until.get(pet["id"])
+        return {
+            "stay_in_frame_enabled": self._stay_active(pet),
+            "kneel_enabled": pet["kneel_enabled"],
+            "break_enabled": pet["break_enabled"],
+            "break_due_at": self.break_due_at.get(pet["id"]),
+            "break_until": break_until,
+            "break_overdue": self.break_overdue.get(pet["id"], False),
+            "bark_enabled": pet["bark_enabled"],
+            "bark_response_seconds": pet["bark_response_seconds"],
+            "bark_record_seconds": pet["bark_record_seconds"],
+            "bark_record_enabled": pet["bark_record_enabled"],
+        }
 
     def _public_pet(self, pet: dict[str, Any]) -> dict[str, Any]:
         stay_remaining = None
@@ -499,10 +763,15 @@ class Hub:
             "connected": bool(self.clients.get(pet["id"])),
             "clients": len(self.clients.get(pet["id"], set())),
             "presence": self.presence.get(pet["id"]),
+            "kneeling": self.kneeling.get(pet["id"]),
             "parts": self.parts.get(pet["id"], []),
             "connected_at": self.connected_at.get(pet["id"]),
             "live_allowed": self.live_allowed.get(pet["id"], False),
             "live_enabled": self.live_enabled.get(pet["id"], False),
+            "break_due_at": self.break_due_at.get(pet["id"]),
+            "break_until": self.break_until.get(pet["id"]),
+            "break_overdue": self.break_overdue.get(pet["id"], False),
+            "bark_pending_until": self.bark_pending_until.get(pet["id"]),
         }
 
     def _stay_active(self, pet: dict[str, Any]) -> bool:
@@ -521,6 +790,18 @@ class Hub:
         while True:
             await asyncio.sleep(1)
             await self._expire_stay_if_needed()
+            now = time.time()
+            for pet in await self.store.list_pets():
+                pet_id = pet["id"]
+                if pet["break_enabled"] and self.break_until.get(pet_id) and now > self.break_until[pet_id]:
+                    if not self.break_overdue.get(pet_id):
+                        self.break_overdue[pet_id] = True
+                        await self.store.log("break_overdue", pet_id, {})
+                        await self.broadcast_pet_settings(pet_id)
+                pending_until = self.bark_pending_until.get(pet_id)
+                if pending_until and now > pending_until:
+                    self.bark_pending_until.pop(pet_id, None)
+                    await self.store.log("bark_missed", pet_id, {})
             await self.broadcast_trainers()
 
     async def _random_loop(self) -> None:
@@ -529,18 +810,27 @@ class Hub:
             now = time.time()
             for pet in await self.store.list_pets():
                 pet_id = pet["id"]
-                if not pet["random_enabled"] or not self.clients.get(pet_id):
+                connected = bool(self.clients.get(pet_id))
+                if not pet["random_enabled"] or not connected:
                     self.next_click_at.pop(pet_id, None)
-                    continue
-                due = self.next_click_at.get(pet_id)
-                if due is None:
-                    self.next_click_at[pet_id] = now + random.randint(pet["click_min_seconds"], pet["click_max_seconds"])
-                    continue
-                if now >= due:
-                    await self.store.log("random_click", pet_id, {})
-                    await self.broadcast_clients(pet_id, {"type": "play_click", "source": "random"})
-                    self.next_click_at[pet_id] = now + random.randint(pet["click_min_seconds"], pet["click_max_seconds"])
-                    await self.broadcast_trainers()
+                else:
+                    due = self.next_click_at.get(pet_id)
+                    if due is None:
+                        self.next_click_at[pet_id] = now + random.randint(pet["click_min_seconds"], pet["click_max_seconds"])
+                    elif now >= due:
+                        await self.store.log("random_click", pet_id, {})
+                        await self.broadcast_clients(pet_id, {"type": "play_click", "source": "random"})
+                        self.next_click_at[pet_id] = now + random.randint(pet["click_min_seconds"], pet["click_max_seconds"])
+                        await self.broadcast_trainers()
+                if pet["bark_enabled"] and connected:
+                    bark_due = self.next_bark_at.get(pet_id)
+                    if bark_due is None:
+                        self.next_bark_at[pet_id] = now + random.randint(pet["bark_min_seconds"], pet["bark_max_seconds"])
+                    elif now >= bark_due:
+                        await self.trigger_speak(pet_id, "random")
+                        self.next_bark_at[pet_id] = now + random.randint(pet["bark_min_seconds"], pet["bark_max_seconds"])
+                else:
+                    self.next_bark_at.pop(pet_id, None)
 
 
 store = Store(DB_PATH)
@@ -559,6 +849,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+RECORDING_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
 
@@ -850,6 +1141,50 @@ async def api_click(pet_id: int, request: Request) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.post("/api/pets/{pet_id}/kneel")
+async def api_kneel(pet_id: int, request: Request) -> dict[str, Any]:
+    require_trainer(request)
+    payload = await read_json(request)
+    await hub.set_kneel(pet_id, bool(payload.get("enabled")))
+    return {"ok": True}
+
+
+@app.post("/api/pets/{pet_id}/breaks")
+async def api_breaks(pet_id: int, request: Request) -> dict[str, Any]:
+    require_trainer(request)
+    payload = await read_json(request)
+    await hub.set_breaks(
+        pet_id,
+        bool(payload.get("enabled")),
+        int(payload.get("interval_seconds", 1800)),
+        int(payload.get("duration_seconds", 300)),
+    )
+    return {"ok": True}
+
+
+@app.post("/api/pets/{pet_id}/bark")
+async def api_bark(pet_id: int, request: Request) -> dict[str, Any]:
+    require_trainer(request)
+    payload = await read_json(request)
+    await hub.set_bark(
+        pet_id,
+        bool(payload.get("enabled")),
+        int(payload.get("min_seconds", 30)),
+        int(payload.get("max_seconds", 300)),
+        int(payload.get("response_seconds", 5)),
+        int(payload.get("record_seconds", 10)),
+        bool(payload.get("record_enabled")),
+    )
+    return {"ok": True}
+
+
+@app.post("/api/pets/{pet_id}/speak")
+async def api_speak(pet_id: int, request: Request) -> dict[str, Any]:
+    require_trainer(request)
+    await hub.trigger_speak(pet_id, "manual")
+    return {"ok": True}
+
+
 @app.post("/api/pets/{pet_id}/live")
 async def api_live(pet_id: int, request: Request) -> dict[str, Any]:
     require_trainer(request)
@@ -873,6 +1208,39 @@ async def api_delete_trainer(username: str, request: Request) -> dict[str, Any]:
     require_admin(request)
     await store.delete_trainer(username)
     await store.log("trainer_removed", None, {"username": username})
+    await hub.broadcast_trainers()
+    return {"ok": True}
+
+
+@app.post("/api/logs/clear")
+async def api_clear_logs(request: Request) -> dict[str, Any]:
+    require_trainer(request)
+    await store.clear_logs()
+    await hub.broadcast_trainers()
+    return {"ok": True}
+
+
+@app.get("/api/recordings/{recording_id}")
+async def api_get_recording(recording_id: int, request: Request) -> FileResponse:
+    require_trainer(request)
+    recording = await store.get_recording(recording_id)
+    if not recording:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    path = RECORDING_DIR / recording["filename"]
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Recording file missing")
+    return FileResponse(path, media_type=recording["content_type"], filename=recording["filename"], content_disposition_type="inline")
+
+
+@app.delete("/api/recordings/{recording_id}")
+async def api_delete_recording(recording_id: int, request: Request) -> dict[str, Any]:
+    require_trainer(request)
+    recording = await store.delete_recording(recording_id)
+    if not recording:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    path = RECORDING_DIR / recording["filename"]
+    if path.exists():
+        path.unlink()
     await hub.broadcast_trainers()
     return {"ok": True}
 
@@ -937,11 +1305,18 @@ async def pet_ws(websocket: WebSocket) -> None:
                     bool(payload.get("present")),
                     payload.get("confidence"),
                     [str(part) for part in payload.get("parts", [])],
+                    payload.get("kneeling"),
                 )
             elif payload.get("type") == "live_allowed":
                 await hub.set_live_allowed(pet_id, bool(payload.get("allowed")))
             elif payload.get("type") == "live_frame":
                 await hub.forward_live_frame(pet_id, str(payload.get("frame", "")))
+            elif payload.get("type") == "break":
+                await hub.set_break_state(pet_id, str(payload.get("state")) == "start")
+            elif payload.get("type") == "bark_noise":
+                await hub.handle_bark_noise(pet_id, float(payload.get("level", 0)))
+            elif payload.get("type") == "bark_recording":
+                await hub.save_bark_recording(pet_id, str(payload.get("data_url", "")), int(payload.get("duration_seconds", 0)))
     except WebSocketDisconnect:
         await hub.unregister_client(websocket)
 
@@ -1085,6 +1460,7 @@ TRAINER_HTML = """
         <div class="row">
           <span id="petStatus" class="badge">offline</span>
           <span id="presence" class="badge">unknown</span>
+          <span id="kneeling" class="badge">kneel unknown</span>
           <span id="parts" class="quiet"></span>
         </div>
         <div class="toolbar">
@@ -1108,6 +1484,26 @@ TRAINER_HTML = """
         <div id="stayState" class="quiet"></div>
       </section>
       <section class="panel stack">
+        <h2>Kneel Check</h2>
+        <div class="toolbar">
+          <button id="kneelOn">Turn On</button>
+          <button class="secondary" id="kneelOff">Turn Off</button>
+        </div>
+        <div id="kneelState" class="quiet"></div>
+      </section>
+      <section class="panel stack">
+        <h2>Breaks</h2>
+        <div class="toolbar">
+          <button id="breakOn">Enable</button>
+          <button class="secondary" id="breakOff">Disable</button>
+        </div>
+        <div class="row">
+          <div class="field"><label>Every seconds</label><input id="breakInterval" type="number" min="60" step="1" value="1800"></div>
+          <div class="field"><label>Break seconds</label><input id="breakDuration" type="number" min="30" step="1" value="300"></div>
+        </div>
+        <div id="breakState" class="quiet"></div>
+      </section>
+      <section class="panel stack">
         <h2>Random Clicks</h2>
         <div class="toolbar">
           <button id="randomOn">Enable</button>
@@ -1120,7 +1516,30 @@ TRAINER_HTML = """
         <div id="randomState" class="quiet"></div>
       </section>
       <section class="panel stack">
-        <h2>Event Log</h2>
+        <h2>Bark Check</h2>
+        <div class="toolbar">
+          <button id="manualSpeak">Manual Speak</button>
+          <button id="barkOn">Enable</button>
+          <button class="secondary" id="barkOff">Disable</button>
+        </div>
+        <div class="row">
+          <div class="field"><label>Min seconds</label><input id="barkMin" type="number" min="1" max="6000" step="1" value="30"></div>
+          <div class="field"><label>Max seconds</label><input id="barkMax" type="number" min="1" max="6000" step="1" value="300"></div>
+          <div class="field"><label>Response seconds</label><input id="barkResponse" type="number" min="1" max="60" step="1" value="5"></div>
+          <div class="field"><label>Record seconds</label><input id="barkRecordSeconds" type="number" min="1" max="60" step="1" value="10"></div>
+        </div>
+        <label class="row"><input id="barkRecordEnabled" type="checkbox"> Save bark recordings</label>
+        <div id="barkState" class="quiet"></div>
+      </section>
+      <section class="panel stack">
+        <h2>Bark Recordings</h2>
+        <div id="recordings" class="list"></div>
+      </section>
+      <section class="panel stack">
+        <div class="row" style="justify-content:space-between">
+          <h2>Event Log</h2>
+          <button class="danger" id="clearLogs">Clear Logs</button>
+        </div>
         <div class="logs" id="logs"></div>
       </section>
     </main>
@@ -1132,6 +1551,7 @@ const CLICK_MIN_SECONDS = 1;
 const CLICK_MAX_SECONDS = 6000;
 let state = null;
 let logs = [];
+let recordings = [];
 let selectedPetId = null;
 let liveFramePetId = null;
 let clickRangeDirty = false;
@@ -1159,6 +1579,10 @@ async function del(url, button) {
   const res = await fetch(url, {method: 'DELETE'});
   if (button) { button.disabled = false; button.textContent = old; }
   if (!res.ok) alert(await res.text()); else showToast('Removed');
+}
+
+async function deleteRecording(id, button) {
+  await del(`/api/recordings/${id}`, button);
 }
 
 function badge(text, cls='') { return `<span class="badge ${cls}">${text}</span>`; }
@@ -1191,6 +1615,12 @@ function normalizeClickInputs(changed = 'min') {
 
 function currentClickRange() {
   return normalizeClickInputs(document.activeElement === $('clickMax') ? 'max' : 'min');
+}
+
+function clampSeconds(value, fallback, min, max) {
+  const parsed = Number(value);
+  const seconds = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(max, Math.max(min, Math.round(seconds)));
 }
 
 function markClickRangeDirty(changed) {
@@ -1251,23 +1681,54 @@ function renderPets() {
 function renderSelected() {
   const pet = selectedPet();
   const disabled = !pet;
-  for (const id of ['manualClick','liveOn','liveOff','stayOn','stayOff','randomOn','randomOff']) $(id).disabled = disabled;
+  for (const id of ['manualClick','liveOn','liveOff','stayOn','stayOff','kneelOn','kneelOff','breakOn','breakOff','randomOn','randomOff','manualSpeak','barkOn','barkOff']) $(id).disabled = disabled;
   if (!pet) return;
   $('selectedTitle').textContent = pet.name;
   if (pet.connected) setBadge('petStatus', `${pet.clients} connected`, 'ok'); else setBadge('petStatus', 'offline', 'bad');
   if (pet.presence === true) setBadge('presence', 'in frame', 'ok');
   else if (pet.presence === false) setBadge('presence', 'out of frame', 'bad');
   else setBadge('presence', 'unknown');
+  if (pet.kneeling === true) setBadge('kneeling', 'kneeling', 'ok');
+  else if (pet.kneeling === false) setBadge('kneeling', 'not kneeling', pet.kneel_enabled ? 'bad' : '');
+  else setBadge('kneeling', 'kneel unknown');
   $('parts').textContent = pet.parts?.length ? `Detected: ${pet.parts.join(', ')}` : 'No parts detected yet';
   $('stayState').textContent = pet.stay_enabled
     ? `On${pet.stay_seconds_remaining === null ? '' : `, ${pet.stay_seconds_remaining}s remaining`}`
     : 'Off';
   $('randomState').textContent = pet.random_enabled ? `Enabled, ${pet.click_min_seconds}-${pet.click_max_seconds}s` : 'Disabled';
   syncClickRangeInputs(pet);
+  $('kneelState').textContent = pet.kneel_enabled ? 'On' : 'Off';
+  $('breakInterval').value = pet.break_interval_seconds;
+  $('breakDuration').value = pet.break_duration_seconds;
+  if (pet.break_overdue) $('breakState').textContent = 'Break overdue';
+  else if (pet.break_until) $('breakState').textContent = `On break until ${new Date(pet.break_until * 1000).toLocaleTimeString()}`;
+  else if (pet.break_due_at) $('breakState').textContent = `Next break around ${new Date(pet.break_due_at * 1000).toLocaleTimeString()}`;
+  else $('breakState').textContent = pet.break_enabled ? 'Enabled' : 'Disabled';
+  $('barkMin').value = pet.bark_min_seconds;
+  $('barkMax').value = pet.bark_max_seconds;
+  $('barkResponse').value = pet.bark_response_seconds;
+  $('barkRecordSeconds').value = pet.bark_record_seconds;
+  $('barkRecordEnabled').checked = pet.bark_record_enabled;
+  $('barkState').textContent = pet.bark_enabled
+    ? `Enabled, ${pet.bark_min_seconds}-${pet.bark_max_seconds}s, ${pet.bark_response_seconds}s response`
+    : 'Disabled';
   $('liveState').textContent = pet.live_allowed
     ? (pet.live_enabled ? 'Client allowed live feed; trainer view is on.' : 'Client allowed live feed; trainer view is off.')
     : 'Client has not allowed live feed.';
   if (!pet.live_allowed || !pet.live_enabled || liveFramePetId !== pet.id) clearLiveCanvas();
+}
+
+function renderRecordings() {
+  $('recordings').innerHTML = recordings.map((recording) => `
+    <div class="item">
+      <strong>${esc(recording.pet_name || 'Pet')}</strong>
+      <span class="quiet">${esc(recording.created_at)} - ${Math.round((recording.size_bytes || 0) / 1024)} KB</span>
+      <audio controls src="/api/recordings/${recording.id}"></audio>
+      <div class="row">
+        <a href="/api/recordings/${recording.id}" download>Download</a>
+        <button class="danger" onclick="deleteRecording(${recording.id}, this)">Delete</button>
+      </div>
+    </div>`).join('') || '<div class="quiet">No bark recordings yet.</div>';
 }
 
 function renderLogs() {
@@ -1285,8 +1746,10 @@ function renderLogs() {
 function render(payload) {
   if (payload?.state) state = payload.state;
   if (payload?.logs) logs = payload.logs;
+  if (payload?.state?.recordings) recordings = payload.state.recordings;
   renderPets();
   renderSelected();
+  renderRecordings();
   renderLogs();
 }
 
@@ -1320,6 +1783,7 @@ window.changeCode = async (id) => {
   if (code) await post(`/api/pets/${id}/code`, {code});
 };
 window.removePet = (id, button) => del(`/api/pets/${id}`, button);
+window.deleteRecording = deleteRecording;
 
 $('addPet').onclick = (e) => post('/api/pets', {name: $('newPetName').value, code: $('newPetCode').value}, e.target);
 $('manualClick').onclick = (e) => post(`/api/pets/${selectedPet().id}/click`, {}, e.target);
@@ -1327,14 +1791,44 @@ $('liveOn').onclick = (e) => { clearLiveCanvas(); post(`/api/pets/${selectedPet(
 $('liveOff').onclick = (e) => { clearLiveCanvas(); post(`/api/pets/${selectedPet().id}/live`, {enabled: false}, e.target); };
 $('stayOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled: true, duration_seconds: Number($('stayDuration').value || 0) || null}, e.target);
 $('stayOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled: false}, e.target);
+$('kneelOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/kneel`, {enabled: true}, e.target);
+$('kneelOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/kneel`, {enabled: false}, e.target);
+$('breakOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/breaks`, {
+  enabled: true,
+  interval_seconds: clampSeconds($('breakInterval').value, 1800, 60, 86400),
+  duration_seconds: clampSeconds($('breakDuration').value, 300, 30, 3600)
+}, e.target);
+$('breakOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/breaks`, {
+  enabled: false,
+  interval_seconds: clampSeconds($('breakInterval').value, 1800, 60, 86400),
+  duration_seconds: clampSeconds($('breakDuration').value, 300, 30, 3600)
+}, e.target);
 $('clickMin').oninput = () => markClickRangeDirty('min');
 $('clickMax').oninput = () => markClickRangeDirty('max');
 $('clickMin').onchange = () => markClickRangeDirty('min');
 $('clickMax').onchange = () => markClickRangeDirty('max');
 $('randomOn').onclick = (e) => saveRandomClick(true, e.target);
 $('randomOff').onclick = (e) => saveRandomClick(false, e.target);
+$('manualSpeak').onclick = (e) => post(`/api/pets/${selectedPet().id}/speak`, {}, e.target);
+$('barkOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/bark`, {
+  enabled: true,
+  min_seconds: clampSeconds($('barkMin').value, 30, 1, 6000),
+  max_seconds: clampSeconds($('barkMax').value, 300, 1, 6000),
+  response_seconds: clampSeconds($('barkResponse').value, 5, 1, 60),
+  record_seconds: clampSeconds($('barkRecordSeconds').value, 10, 1, 60),
+  record_enabled: $('barkRecordEnabled').checked
+}, e.target);
+$('barkOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/bark`, {
+  enabled: false,
+  min_seconds: clampSeconds($('barkMin').value, 30, 1, 6000),
+  max_seconds: clampSeconds($('barkMax').value, 300, 1, 6000),
+  response_seconds: clampSeconds($('barkResponse').value, 5, 1, 60),
+  record_seconds: clampSeconds($('barkRecordSeconds').value, 10, 1, 60),
+  record_enabled: $('barkRecordEnabled').checked
+}, e.target);
 $('copyLink').onclick = async () => { showToast(await copyTextFromInput($('petLink')) ? 'Copied' : 'Copy failed'); };
 $('logout').onclick = async () => { await fetch('/api/logout', {method: 'POST'}); location.href = '/'; };
+$('clearLogs').onclick = (e) => { if (confirm('Clear all event logs?')) post('/api/logs/clear', {}, e.target); };
 
 function connectTrainerWs() {
   const liveCanvas = $('liveCanvas');
@@ -1381,6 +1875,7 @@ PET_HTML = """
     <div class="row">
       <span id="status" class="badge">Starting</span>
       <span id="stayWarning" class="stay-warning" hidden>Stay in frame</span>
+      <span id="kneelWarning" class="stay-warning" hidden>Kneel</span>
     </div>
     <ol id="loadSteps" class="quiet" style="margin:0;padding-left:22px" hidden>
       <li id="stepCamera">Camera permission</li>
@@ -1392,6 +1887,9 @@ PET_HTML = """
     <p id="clientMessage" class="quiet" hidden></p>
     <div class="row">
       <label class="row"><input id="allowLive" type="checkbox"> Allow trainer live feed</label>
+      <label class="row"><input id="censorFaces" type="checkbox" checked> Censor faces</label>
+      <button id="breakButton" class="secondary" type="button" hidden>Start Break</button>
+      <span id="breakStatus" class="quiet"></span>
     </div>
   </section>
   <canvas id="canvas" hidden></canvas>
@@ -1409,8 +1907,12 @@ const leavePet = document.getElementById('leavePet');
 const video = document.getElementById('video');
 const status = document.getElementById('status');
 const stayWarning = document.getElementById('stayWarning');
+const kneelWarning = document.getElementById('kneelWarning');
 const clientMessage = document.getElementById('clientMessage');
 const allowLive = document.getElementById('allowLive');
+const censorFaces = document.getElementById('censorFaces');
+const breakButton = document.getElementById('breakButton');
+const breakStatus = document.getElementById('breakStatus');
 const canvas = document.getElementById('canvas');
 const loadSteps = document.getElementById('loadSteps');
 const loadStepIds = ['stepCamera', 'stepJs', 'stepWasm', 'stepModel', 'stepDetect'];
@@ -1418,6 +1920,19 @@ let ws = null;
 let poseLandmarker = null;
 let faceDetector = null;
 let stayEnabled = false;
+let kneelEnabled = false;
+let lastKneeling = null;
+let breakEnabled = false;
+let breakActive = false;
+let breakOverdue = false;
+let breakUntil = null;
+let barkPendingUntil = 0;
+let barkRecordSeconds = 10;
+let barkRecordEnabled = false;
+let audioAnalyser = null;
+let audioData = null;
+let audioNoiseBaseline = 0.02;
+let mediaRecorder = null;
 let lastPresent = null;
 let lastParts = '';
 let lastSent = 0;
@@ -1457,7 +1972,7 @@ function armAudioRetry() {
     document.removeEventListener('pointerdown', retry);
     document.removeEventListener('keydown', retry);
     audioRetryArmed = false;
-    ensureAudioStarted().then(() => updateBeep(lastPresent));
+    ensureAudioStarted().then(() => updateBeep());
   };
   document.addEventListener('pointerdown', retry, {once: true});
   document.addEventListener('keydown', retry, {once: true});
@@ -1549,6 +2064,83 @@ function stopBeep() {
   source.disconnect();
 }
 
+function speakText(text) {
+  if (!('speechSynthesis' in window)) return;
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.rate = 1;
+  utterance.pitch = 1;
+  speechSynthesis.speak(utterance);
+}
+
+function initNoiseDetection(stream) {
+  if (!audioContext) return;
+  const audioTracks = stream.getAudioTracks();
+  if (!audioTracks.length) return;
+  const source = audioContext.createMediaStreamSource(new MediaStream(audioTracks));
+  audioAnalyser = audioContext.createAnalyser();
+  audioAnalyser.fftSize = 1024;
+  audioData = new Uint8Array(audioAnalyser.fftSize);
+  source.connect(audioAnalyser);
+}
+
+function currentNoiseLevel() {
+  if (!audioAnalyser || !audioData) return 0;
+  audioAnalyser.getByteTimeDomainData(audioData);
+  let sum = 0;
+  for (const value of audioData) {
+    const centered = (value - 128) / 128;
+    sum += centered * centered;
+  }
+  return Math.sqrt(sum / audioData.length);
+}
+
+function watchForBark(until) {
+  const tick = () => {
+    if (performance.now() > until || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const level = currentNoiseLevel();
+    audioNoiseBaseline = audioNoiseBaseline * 0.97 + level * 0.03;
+    if (level > Math.max(0.08, audioNoiseBaseline * 3.5)) {
+      ws.send(JSON.stringify({type: 'bark_noise', level}));
+      return;
+    }
+    requestAnimationFrame(tick);
+  };
+  tick();
+}
+
+function startBarkRecording(seconds) {
+  if (!cameraStream || !cameraStream.getAudioTracks().length || !window.MediaRecorder) return;
+  const stream = new MediaStream(cameraStream.getAudioTracks());
+  const chunks = [];
+  mediaRecorder = new MediaRecorder(stream);
+  mediaRecorder.ondataavailable = (event) => {
+    if (event.data.size) chunks.push(event.data);
+  };
+  mediaRecorder.onstop = () => {
+    const blob = new Blob(chunks, {type: mediaRecorder.mimeType || 'audio/webm'});
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type: 'bark_recording', data_url: reader.result, duration_seconds: seconds}));
+      }
+    };
+    reader.readAsDataURL(blob);
+  };
+  mediaRecorder.start();
+  setTimeout(() => {
+    if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
+  }, seconds * 1000);
+}
+
+async function handleSpeak(message) {
+  speakText('Speak!');
+  barkPendingUntil = performance.now() + Number(message.response_seconds || 5) * 1000;
+  barkRecordSeconds = Number(message.record_seconds || 10);
+  barkRecordEnabled = Boolean(message.record_enabled);
+  if (barkRecordEnabled) startBarkRecording(barkRecordSeconds);
+  watchForBark(barkPendingUntil);
+}
+
 function setStep(id, state) {
   const item = document.getElementById(id);
   if (!item) return;
@@ -1621,8 +2213,17 @@ leavePet.onclick = async () => {
   lastPresent = null;
   lastParts = '';
   stayEnabled = false;
+  kneelEnabled = false;
+  lastKneeling = null;
+  breakEnabled = false;
+  breakActive = false;
+  breakOverdue = false;
+  if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
   stopBeep();
   stayWarning.hidden = true;
+  kneelWarning.hidden = true;
+  breakButton.hidden = true;
+  breakStatus.textContent = '';
   clientPanel.hidden = true;
   codePanel.hidden = false;
   petCode.value = '';
@@ -1632,9 +2233,17 @@ leavePet.onclick = async () => {
 };
 
 allowLive.onchange = () => {
+  if (allowLive.checked && !confirm('Allow your trainer to request a live camera feed?')) {
+    allowLive.checked = false;
+  }
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({type: 'live_allowed', allowed: allowLive.checked}));
   }
+};
+
+breakButton.onclick = () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({type: 'break', state: breakActive ? 'stop' : 'start'}));
 };
 
 function connectWs() {
@@ -1650,11 +2259,23 @@ function connectWs() {
     const message = JSON.parse(event.data);
     if (message.type === 'settings') {
       stayEnabled = Boolean(message.settings.stay_in_frame_enabled);
+      kneelEnabled = Boolean(message.settings.kneel_enabled);
+      breakEnabled = Boolean(message.settings.break_enabled);
+      breakUntil = message.settings.break_until || null;
+      breakActive = Boolean(breakUntil);
+      breakOverdue = Boolean(message.settings.break_overdue);
       stayWarning.hidden = !stayEnabled;
-      await updateBeep(lastPresent);
+      kneelWarning.hidden = !kneelEnabled;
+      breakButton.hidden = !breakEnabled;
+      breakButton.textContent = breakActive ? 'End Break' : 'Start Break';
+      breakStatus.textContent = breakOverdue ? 'Break overdue' : breakActive ? 'On break' : '';
+      await updateBeep();
     }
     if (message.type === 'play_click') {
       await playClick();
+    }
+    if (message.type === 'speak') {
+      await handleSpeak(message);
     }
     if (message.type === 'live_request') {
       liveRequested = Boolean(message.enabled);
@@ -1664,7 +2285,8 @@ function connectWs() {
 }
 
 async function updateBeep(present) {
-  if (stayEnabled && present === false) {
+  const shouldBeep = (stayEnabled && lastPresent === false) || (kneelEnabled && lastPresent === true && lastKneeling === false) || breakOverdue;
+  if (shouldBeep) {
     await startBeep();
   } else {
     stopBeep();
@@ -1685,33 +2307,67 @@ function classifyParts(landmarks) {
   return parts;
 }
 
+function landmarkVisible(point) {
+  return point && (point.visibility ?? 1) > 0.35;
+}
+
+function angleDegrees(a, b, c) {
+  const ab = {x: a.x - b.x, y: a.y - b.y};
+  const cb = {x: c.x - b.x, y: c.y - b.y};
+  const dot = ab.x * cb.x + ab.y * cb.y;
+  const mag = Math.hypot(ab.x, ab.y) * Math.hypot(cb.x, cb.y);
+  if (!mag) return 180;
+  return Math.acos(Math.max(-1, Math.min(1, dot / mag))) * 180 / Math.PI;
+}
+
+function detectKneeling(landmarks) {
+  const leftReady = landmarkVisible(landmarks[23]) && landmarkVisible(landmarks[25]) && landmarkVisible(landmarks[27]);
+  const rightReady = landmarkVisible(landmarks[24]) && landmarkVisible(landmarks[26]) && landmarkVisible(landmarks[28]);
+  const bent = [];
+  if (leftReady) bent.push(angleDegrees(landmarks[23], landmarks[25], landmarks[27]) < 135);
+  if (rightReady) bent.push(angleDegrees(landmarks[24], landmarks[26], landmarks[28]) < 135);
+  if (!bent.length) return null;
+  return bent.some(Boolean);
+}
+
 async function analyze(result) {
   if (!result.landmarks || !result.landmarks.length) {
     if (faceDetector) {
       try {
         const faces = await faceDetector.detect(video);
-        if (faces.length) return {present: true, confidence: 0.75, parts: ['head/profile']};
+        if (faces.length) return {present: true, confidence: 0.75, parts: ['head/profile'], kneeling: null};
       } catch (_) {}
     }
-    return {present: false, confidence: 0, parts: []};
+    return {present: false, confidence: 0, parts: [], kneeling: null};
   }
   const landmarks = result.landmarks[0];
   const visibleCount = landmarks.filter((point) => (point.visibility ?? 1) > 0.35).length;
   const parts = classifyParts(landmarks);
-  return {present: parts.length > 0 || visibleCount >= 2, confidence: Math.min(1, visibleCount / 12), parts};
+  return {present: parts.length > 0 || visibleCount >= 2, confidence: Math.min(1, visibleCount / 12), parts, kneeling: detectKneeling(landmarks)};
 }
 
-async function sendPresence(present, confidence, parts) {
+let absentCandidateAt = null;
+
+async function sendPresence(rawPresent, confidence, parts, kneeling) {
   const now = performance.now();
+  let present = rawPresent;
+  if (!rawPresent) {
+    if (absentCandidateAt === null) absentCandidateAt = now;
+    if (now - absentCandidateAt < 2000) present = lastPresent !== null ? lastPresent : true;
+  } else {
+    absentCandidateAt = null;
+  }
   const partsText = parts.join(', ');
   setStatus(present ? 'In frame' : 'Out of frame', present ? 'ok' : 'bad');
-  if (present === lastPresent && partsText === lastParts && now - lastSent < 5000) return;
+  kneelWarning.hidden = !kneelEnabled || kneeling === true;
+  if (present === lastPresent && partsText === lastParts && kneeling === lastKneeling && now - lastSent < 5000) return;
   lastPresent = present;
+  lastKneeling = kneeling;
   lastParts = partsText;
   lastSent = now;
-  await updateBeep(present);
+  await updateBeep();
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({type: 'presence', present, confidence, parts}));
+    ws.send(JSON.stringify({type: 'presence', present, confidence, parts, kneeling}));
   }
 }
 
@@ -1751,11 +2407,12 @@ async function startClient(audioStart = null) {
   const audioPromise = audioStart || ensureAudioStarted();
   setStatus('Requesting camera');
   setStep('stepCamera', 'active');
-  const stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: 'user'}, audio: false});
+  const stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: 'user'}, audio: true});
   cameraStream = stream;
   setStep('stepCamera', 'done');
   video.srcObject = stream;
   await video.play();
+  initNoiseDetection(stream);
   audioPromise.then((ok) => {
     if (ok) logAudio('ready');
   });
@@ -1766,7 +2423,7 @@ async function startClient(audioStart = null) {
   requestAnimationFrame(loop);
 }
 
-function maybeSendLiveFrame(now) {
+async function maybeSendLiveFrame(now) {
   if (!liveRequested || !allowLive.checked || !ws || ws.readyState !== WebSocket.OPEN || now - lastLiveAt < 500) return;
   lastLiveAt = now;
   const width = 480;
@@ -1775,6 +2432,23 @@ function maybeSendLiveFrame(now) {
   canvas.height = height;
   const ctx = canvas.getContext('2d');
   ctx.drawImage(video, 0, 0, width, height);
+  if (censorFaces.checked && faceDetector) {
+    try {
+      const faces = await faceDetector.detect(video);
+      for (const face of faces) {
+        const box = face.boundingBox;
+        const x = box.x * width / video.videoWidth;
+        const y = box.y * height / video.videoHeight;
+        const w = box.width * width / video.videoWidth;
+        const h = box.height * height / video.videoHeight;
+        ctx.filter = 'blur(18px)';
+        ctx.drawImage(canvas, x, y, w, h, x, y, w, h);
+        ctx.filter = 'none';
+        ctx.fillStyle = 'rgba(0,0,0,.18)';
+        ctx.fillRect(x, y, w, h);
+      }
+    } catch (_) {}
+  }
   ws.send(JSON.stringify({type: 'live_frame', frame: canvas.toDataURL('image/jpeg', 0.55)}));
 }
 
@@ -1782,7 +2456,7 @@ async function loop() {
   if (poseLandmarker && video.readyState >= 2) {
     const result = poseLandmarker.detectForVideo(video, performance.now());
     const analyzed = await analyze(result);
-    await sendPresence(analyzed.present, analyzed.confidence, analyzed.parts);
+    await sendPresence(analyzed.present, analyzed.confidence, analyzed.parts, analyzed.kneeling);
     setStep('stepDetect', 'done');
     loadSteps.hidden = true;
   }
