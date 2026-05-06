@@ -130,6 +130,7 @@ class Store:
                     bark_response_seconds INTEGER NOT NULL DEFAULT 5,
                     bark_record_seconds INTEGER NOT NULL DEFAULT 10,
                     bark_record_enabled INTEGER NOT NULL DEFAULT 0,
+                    censor_color TEXT NOT NULL DEFAULT '#000000',
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS logs (
@@ -165,6 +166,7 @@ class Store:
                 "bark_response_seconds": "INTEGER NOT NULL DEFAULT 5",
                 "bark_record_seconds": "INTEGER NOT NULL DEFAULT 10",
                 "bark_record_enabled": "INTEGER NOT NULL DEFAULT 0",
+                "censor_color": "TEXT NOT NULL DEFAULT '#000000'",
             }
             for column, definition in pet_defaults.items():
                 if column not in pet_columns:
@@ -329,6 +331,17 @@ class Store:
             )
             self.connection.commit()
 
+    async def set_censor_color(self, pet_id: int, color: str) -> None:
+        color = color.strip()
+        if not color.startswith("#") or len(color) not in {4, 7} or not all(char in "0123456789abcdefABCDEF" for char in color[1:]):
+            color = "#000000"
+        async with self.lock:
+            self.connection.execute(
+                "UPDATE pets SET censor_color = ? WHERE id = ?",
+                (color, pet_id),
+            )
+            self.connection.commit()
+
     async def add_recording(self, pet_id: int, filename: str, content_type: str, duration_seconds: int, size_bytes: int) -> int:
         async with self.lock:
             cursor = self.connection.execute(
@@ -429,6 +442,7 @@ class Store:
             "bark_response_seconds": row["bark_response_seconds"],
             "bark_record_seconds": row["bark_record_seconds"],
             "bark_record_enabled": bool(row["bark_record_enabled"]),
+            "censor_color": row["censor_color"],
             "created_at": row["created_at"],
         }
 
@@ -516,6 +530,15 @@ class Hub:
         await self.broadcast_pet_settings(pet_id)
         await self.broadcast_trainers()
 
+    async def set_censor_color(self, pet_id: int, color: str) -> None:
+        color = color.strip()
+        if not color.startswith("#") or len(color) not in {4, 7} or not all(char in "0123456789abcdefABCDEF" for char in color[1:]):
+            color = "#000000"
+        await self.store.set_censor_color(pet_id, color)
+        await self.store.log("censor_color_updated", pet_id, {"color": color})
+        await self.broadcast_pet_settings(pet_id)
+        await self.broadcast_trainers()
+
     async def set_random_click(self, pet_id: int, enabled: bool, min_seconds: int, max_seconds: int) -> None:
         min_seconds = min(CLICK_MAX_SECONDS, max(CLICK_MIN_SECONDS, min_seconds))
         max_seconds = min(CLICK_MAX_SECONDS, max(CLICK_MIN_SECONDS, max_seconds))
@@ -578,13 +601,14 @@ class Hub:
         pet = await self.store.get_pet(pet_id)
         if not pet:
             return
+        record_enabled = bool(pet["bark_record_enabled"] or source == "manual")
         self.bark_pending_until[pet_id] = time.time() + pet["bark_response_seconds"]
-        await self.store.log("speak_prompt", pet_id, {"source": source, "response_seconds": pet["bark_response_seconds"]})
+        await self.store.log("speak_prompt", pet_id, {"source": source, "response_seconds": pet["bark_response_seconds"], "record_enabled": record_enabled})
         await self.broadcast_clients(pet_id, {
             "type": "speak",
             "response_seconds": pet["bark_response_seconds"],
             "record_seconds": pet["bark_record_seconds"],
-            "record_enabled": pet["bark_record_enabled"],
+            "record_enabled": record_enabled,
         })
         await self.broadcast_trainers()
 
@@ -602,7 +626,7 @@ class Hub:
                 await self.store.log("pet_knelt" if kneeling else "pet_not_kneeling", pet_id, {"confidence": confidence})
         await self.broadcast_trainers()
 
-    async def set_break_state(self, pet_id: int, active: bool) -> None:
+    async def set_break_state(self, pet_id: int, active: bool, source: str = "pet") -> None:
         pet = await self.store.get_pet(pet_id)
         if not pet or not pet["break_enabled"]:
             return
@@ -611,13 +635,13 @@ class Hub:
             self.break_started_at[pet_id] = now
             self.break_until[pet_id] = now + pet["break_duration_seconds"]
             self.break_overdue[pet_id] = False
-            await self.store.log("break_started", pet_id, {"duration_seconds": pet["break_duration_seconds"]})
+            await self.store.log("break_started", pet_id, {"duration_seconds": pet["break_duration_seconds"], "source": source})
         else:
             self.break_started_at.pop(pet_id, None)
             self.break_until.pop(pet_id, None)
             self.break_overdue.pop(pet_id, None)
             self.break_due_at[pet_id] = now + pet["break_interval_seconds"]
-            await self.store.log("break_ended", pet_id, {})
+            await self.store.log("break_ended", pet_id, {"source": source})
         await self.broadcast_pet_settings(pet_id)
         await self.broadcast_trainers()
 
@@ -640,7 +664,8 @@ class Hub:
             blob = base64.b64decode(encoded, validate=True)
         except Exception:
             return
-        if not blob or len(blob) > 5_000_000:
+        if not blob or len(blob) > 25_000_000:
+            await self.store.log("bark_recording_rejected", pet_id, {"size_bytes": len(blob)})
             return
         RECORDING_DIR.mkdir(parents=True, exist_ok=True)
         filename = f"bark-{pet_id}-{int(time.time())}-{secrets.token_hex(4)}.webm"
@@ -648,6 +673,13 @@ class Hub:
         path.write_bytes(blob)
         recording_id = await self.store.add_recording(pet_id, filename, content_type, duration_seconds, len(blob))
         await self.store.log("bark_recording_saved", pet_id, {"recording_id": recording_id, "size_bytes": len(blob)})
+        await self.broadcast_trainers()
+
+    async def log_client_event(self, pet_id: int, event: str, detail: dict[str, Any]) -> None:
+        allowed = {"bark_recording_failed", "bark_recording_started", "bark_recording_sent"}
+        if event not in allowed:
+            return
+        await self.store.log(event, pet_id, detail)
         await self.broadcast_trainers()
 
     async def set_live_allowed(self, pet_id: int, allowed: bool) -> None:
@@ -750,6 +782,7 @@ class Hub:
             "bark_response_seconds": pet["bark_response_seconds"],
             "bark_record_seconds": pet["bark_record_seconds"],
             "bark_record_enabled": pet["bark_record_enabled"],
+            "censor_color": pet["censor_color"],
         }
 
     def _public_pet(self, pet: dict[str, Any]) -> dict[str, Any]:
@@ -1185,6 +1218,22 @@ async def api_speak(pet_id: int, request: Request) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.post("/api/pets/{pet_id}/break-state")
+async def api_break_state(pet_id: int, request: Request) -> dict[str, Any]:
+    require_trainer(request)
+    payload = await read_json(request)
+    await hub.set_break_state(pet_id, bool(payload.get("active")), "trainer")
+    return {"ok": True}
+
+
+@app.post("/api/pets/{pet_id}/censor")
+async def api_censor(pet_id: int, request: Request) -> dict[str, Any]:
+    require_trainer(request)
+    payload = await read_json(request)
+    await hub.set_censor_color(pet_id, str(payload.get("color", "#000000")))
+    return {"ok": True}
+
+
 @app.post("/api/pets/{pet_id}/live")
 async def api_live(pet_id: int, request: Request) -> dict[str, Any]:
     require_trainer(request)
@@ -1317,6 +1366,8 @@ async def pet_ws(websocket: WebSocket) -> None:
                 await hub.handle_bark_noise(pet_id, float(payload.get("level", 0)))
             elif payload.get("type") == "bark_recording":
                 await hub.save_bark_recording(pet_id, str(payload.get("data_url", "")), int(payload.get("duration_seconds", 0)))
+            elif payload.get("type") == "client_log":
+                await hub.log_client_event(pet_id, str(payload.get("event", "")), dict(payload.get("detail", {})))
     except WebSocketDisconnect:
         await hub.unregister_client(websocket)
 
@@ -1496,12 +1547,21 @@ TRAINER_HTML = """
         <div class="toolbar">
           <button id="breakOn">Enable</button>
           <button class="secondary" id="breakOff">Disable</button>
+          <button class="secondary" id="breakStart">Start Break</button>
+          <button class="secondary" id="breakStop">End Break</button>
         </div>
         <div class="row">
           <div class="field"><label>Every seconds</label><input id="breakInterval" type="number" min="60" step="1" value="1800"></div>
           <div class="field"><label>Break seconds</label><input id="breakDuration" type="number" min="30" step="1" value="300"></div>
         </div>
         <div id="breakState" class="quiet"></div>
+      </section>
+      <section class="panel stack">
+        <h2>Privacy</h2>
+        <div class="row">
+          <div class="field"><label>Censor color</label><input id="censorColor" type="color" value="#000000"></div>
+          <button id="saveCensor">Save Censor Color</button>
+        </div>
       </section>
       <section class="panel stack">
         <h2>Random Clicks</h2>
@@ -1737,7 +1797,7 @@ function renderPets() {
 function renderSelected() {
   const pet = selectedPet();
   const disabled = !pet;
-  for (const id of ['manualClick','liveOn','liveOff','stayOn','stayOff','kneelOn','kneelOff','breakOn','breakOff','randomOn','randomOff','manualSpeak','barkOn','barkOff']) $(id).disabled = disabled;
+  for (const id of ['manualClick','liveOn','liveOff','stayOn','stayOff','kneelOn','kneelOff','breakOn','breakOff','breakStart','breakStop','saveCensor','randomOn','randomOff','manualSpeak','barkOn','barkOff']) $(id).disabled = disabled;
   if (!pet) return;
   $('selectedTitle').textContent = pet.name;
   if (pet.connected) setBadge('petStatus', `${pet.clients} connected`, 'ok'); else setBadge('petStatus', 'offline', 'bad');
@@ -1756,6 +1816,7 @@ function renderSelected() {
   $('kneelState').textContent = pet.kneel_enabled ? 'On' : 'Off';
   syncSettingInput('breakInterval', pet.break_interval_seconds, 'breakInterval', pet.id);
   syncSettingInput('breakDuration', pet.break_duration_seconds, 'breakDuration', pet.id);
+  syncSettingInput('censorColor', pet.censor_color || '#000000', 'censorColor', pet.id);
   if (pet.break_overdue) $('breakState').textContent = 'Break overdue';
   else if (pet.break_until) $('breakState').textContent = `On break until ${new Date(pet.break_until * 1000).toLocaleTimeString()}`;
   else if (pet.break_due_at) $('breakState').textContent = `Next break around ${new Date(pet.break_due_at * 1000).toLocaleTimeString()}`;
@@ -1851,8 +1912,15 @@ $('kneelOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/kneel`, {enabl
 $('kneelOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/kneel`, {enabled: false}, e.target);
 $('breakInterval').oninput = () => markSettingDirty('breakInterval');
 $('breakDuration').oninput = () => markSettingDirty('breakDuration');
+$('censorColor').oninput = () => markSettingDirty('censorColor');
 $('breakOn').onclick = (e) => saveBreaks(true, e.target);
 $('breakOff').onclick = (e) => saveBreaks(false, e.target);
+$('breakStart').onclick = (e) => post(`/api/pets/${selectedPet().id}/break-state`, {active: true}, e.target);
+$('breakStop').onclick = (e) => post(`/api/pets/${selectedPet().id}/break-state`, {active: false}, e.target);
+$('saveCensor').onclick = async (e) => {
+  const result = await post(`/api/pets/${selectedPet().id}/censor`, {color: $('censorColor').value}, e.target);
+  if (result) clearSettingDirty('censorColor');
+};
 $('clickMin').oninput = () => markClickRangeDirty('min');
 $('clickMax').oninput = () => markClickRangeDirty('max');
 $('clickMin').onchange = () => markClickRangeDirty('min');
@@ -1971,6 +2039,7 @@ let breakUntil = null;
 let barkPendingUntil = 0;
 let barkRecordSeconds = 10;
 let barkRecordEnabled = false;
+let censorColor = '#000000';
 let audioAnalyser = null;
 let audioData = null;
 let audioNoiseBaseline = 0.02;
@@ -2159,27 +2228,59 @@ function watchForBark(until) {
 }
 
 function startBarkRecording(seconds) {
-  if (!cameraStream || !cameraStream.getAudioTracks().length || !window.MediaRecorder) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!cameraStream || !cameraStream.getAudioTracks().length) {
+    ws.send(JSON.stringify({type: 'client_log', event: 'bark_recording_failed', detail: {reason: 'no_microphone_track'}}));
+    setMessage('Bark recording failed: microphone is not available.');
+    return;
+  }
+  if (!window.MediaRecorder) {
+    ws.send(JSON.stringify({type: 'client_log', event: 'bark_recording_failed', detail: {reason: 'media_recorder_unsupported'}}));
+    setMessage('Bark recording failed: MediaRecorder is not supported.');
+    return;
+  }
+  if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
   const stream = new MediaStream(cameraStream.getAudioTracks());
   const chunks = [];
-  mediaRecorder = new MediaRecorder(stream);
+  const mimeTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+  const mimeType = mimeTypes.find((type) => MediaRecorder.isTypeSupported(type)) || '';
+  try {
+    mediaRecorder = new MediaRecorder(stream, mimeType ? {mimeType} : undefined);
+  } catch (error) {
+    ws.send(JSON.stringify({type: 'client_log', event: 'bark_recording_failed', detail: {reason: 'recorder_create_failed', message: String(error)}}));
+    setMessage(`Bark recording failed: ${error?.message || error}`);
+    return;
+  }
   mediaRecorder.ondataavailable = (event) => {
     if (event.data.size) chunks.push(event.data);
   };
   mediaRecorder.onstop = () => {
+    if (!chunks.length) {
+      ws.send(JSON.stringify({type: 'client_log', event: 'bark_recording_failed', detail: {reason: 'empty_recording'}}));
+      setMessage('Bark recording was empty.');
+      return;
+    }
     const blob = new Blob(chunks, {type: mediaRecorder.mimeType || 'audio/webm'});
     const reader = new FileReader();
     reader.onload = () => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({type: 'bark_recording', data_url: reader.result, duration_seconds: seconds}));
+        ws.send(JSON.stringify({type: 'client_log', event: 'bark_recording_sent', detail: {size_bytes: blob.size, mime_type: blob.type}}));
       }
     };
     reader.readAsDataURL(blob);
   };
-  mediaRecorder.start();
+  mediaRecorder.onerror = (event) => {
+    ws.send(JSON.stringify({type: 'client_log', event: 'bark_recording_failed', detail: {reason: 'recorder_error', message: String(event.error || event)}}));
+  };
+  mediaRecorder.start(250);
+  ws.send(JSON.stringify({type: 'client_log', event: 'bark_recording_started', detail: {seconds, mime_type: mediaRecorder.mimeType}}));
   setTimeout(() => {
-    if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
-  }, seconds * 1000);
+    if (mediaRecorder?.state === 'recording') {
+      mediaRecorder.requestData();
+      mediaRecorder.stop();
+    }
+  }, Math.max(1, seconds) * 1000);
 }
 
 async function handleSpeak(message) {
@@ -2315,6 +2416,7 @@ function connectWs() {
       breakUntil = message.settings.break_until || null;
       breakActive = Boolean(breakUntil);
       breakOverdue = Boolean(message.settings.break_overdue);
+      censorColor = message.settings.censor_color || '#000000';
       stayWarning.hidden = !stayEnabled;
       kneelWarning.hidden = !kneelEnabled;
       breakButton.hidden = !breakEnabled;
@@ -2421,7 +2523,7 @@ function censorBoxes(ctx, width, height, boxes) {
     ctx.save();
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(pixelCanvas, 0, 0, 10, 10, x, y, w, h);
-    ctx.fillStyle = 'rgba(0, 0, 0, .42)';
+    ctx.fillStyle = censorColor || '#000000';
     ctx.fillRect(x, y, w, h);
     ctx.restore();
   }
@@ -2434,6 +2536,34 @@ function drawCameraFrame(targetCanvas, width, height, censor) {
   ctx.drawImage(video, 0, 0, width, height);
   if (censor) censorBoxes(ctx, width, height, lastFaceBoxes);
   return ctx;
+}
+
+async function refreshFaceBoxes() {
+  if (poseLandmarker && video.readyState >= 2) {
+    try {
+      const result = poseLandmarker.detectForVideo(video, performance.now());
+      if (result.landmarks?.length) {
+        lastFaceBoxes = faceBoxesFromLandmarks(result.landmarks[0]);
+        return;
+      }
+    } catch (_) {}
+  }
+  if (faceDetector && video.readyState >= 2) {
+    try {
+      const faces = await faceDetector.detect(video);
+      lastFaceBoxes = faces.map((face) => {
+        const box = face.boundingBox;
+        return {
+          x: (box.x ?? box.left ?? 0) / video.videoWidth,
+          y: (box.y ?? box.top ?? 0) / video.videoHeight,
+          w: box.width / video.videoWidth,
+          h: box.height / video.videoHeight,
+        };
+      });
+      return;
+    } catch (_) {}
+  }
+  lastFaceBoxes = [];
 }
 
 async function analyze(result) {
@@ -2554,6 +2684,7 @@ async function maybeSendLiveFrame(now) {
   lastLiveAt = now;
   const width = 480;
   const height = Math.round(width * video.videoHeight / video.videoWidth) || 270;
+  if (censorFaces.checked) await refreshFaceBoxes();
   drawCameraFrame(canvas, width, height, censorFaces.checked);
   ws.send(JSON.stringify({type: 'live_frame', frame: canvas.toDataURL('image/jpeg', 0.55)}));
 }
