@@ -617,8 +617,7 @@ def require_admin(request: Request) -> dict[str, str]:
 
 
 def render_page(title: str, body: str) -> HTMLResponse:
-    return HTMLResponse(
-        f"""<!doctype html>
+    html = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -694,6 +693,13 @@ h1, h2, h3 {{ margin: 0; }}
 </script>
 </body>
 </html>"""
+    return HTMLResponse(
+        html,
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
     )
 
 
