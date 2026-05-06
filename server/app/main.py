@@ -1134,6 +1134,8 @@ let state = null;
 let logs = [];
 let selectedPetId = null;
 let liveFramePetId = null;
+let clickRangeDirty = false;
+let clickRangePetId = null;
 
 function showToast(text) {
   $('toast').textContent = text;
@@ -1170,11 +1172,6 @@ function esc(value) {
 }
 function selectedPet() { return state?.pets.find((pet) => pet.id === selectedPetId) || state?.pets[0]; }
 
-function setInputUnlessFocused(id, value) {
-  const input = $(id);
-  if (document.activeElement !== input) input.value = value;
-}
-
 function clampClickSeconds(value, fallback) {
   const parsed = Number(value);
   const seconds = Number.isFinite(parsed) ? parsed : fallback;
@@ -1194,6 +1191,32 @@ function normalizeClickInputs(changed = 'min') {
 
 function currentClickRange() {
   return normalizeClickInputs(document.activeElement === $('clickMax') ? 'max' : 'min');
+}
+
+function markClickRangeDirty(changed) {
+  clickRangeDirty = true;
+  clickRangePetId = selectedPet()?.id ?? null;
+  normalizeClickInputs(changed);
+}
+
+function syncClickRangeInputs(pet) {
+  if (clickRangePetId !== pet.id) {
+    clickRangeDirty = false;
+    clickRangePetId = pet.id;
+  }
+  if (clickRangeDirty) return;
+  $('clickMin').value = pet.click_min_seconds;
+  $('clickMax').value = pet.click_max_seconds;
+}
+
+async function saveRandomClick(enabled, button) {
+  const pet = selectedPet();
+  const range = currentClickRange();
+  const result = await post(`/api/pets/${pet.id}/random-click`, {enabled, ...range}, button);
+  if (result) {
+    clickRangeDirty = false;
+    clickRangePetId = pet.id;
+  }
 }
 
 function clearLiveCanvas() {
@@ -1240,8 +1263,7 @@ function renderSelected() {
     ? `On${pet.stay_seconds_remaining === null ? '' : `, ${pet.stay_seconds_remaining}s remaining`}`
     : 'Off';
   $('randomState').textContent = pet.random_enabled ? `Enabled, ${pet.click_min_seconds}-${pet.click_max_seconds}s` : 'Disabled';
-  setInputUnlessFocused('clickMin', pet.click_min_seconds);
-  setInputUnlessFocused('clickMax', pet.click_max_seconds);
+  syncClickRangeInputs(pet);
   $('liveState').textContent = pet.live_allowed
     ? (pet.live_enabled ? 'Client allowed live feed; trainer view is on.' : 'Client allowed live feed; trainer view is off.')
     : 'Client has not allowed live feed.';
@@ -1292,7 +1314,7 @@ async function copyTextFromInput(input) {
   }
 }
 
-window.selectPet = (id) => { selectedPetId = id; clearLiveCanvas(); render({state, logs}); };
+window.selectPet = (id) => { selectedPetId = id; clickRangeDirty = false; clickRangePetId = id; clearLiveCanvas(); render({state, logs}); };
 window.changeCode = async (id) => {
   const code = prompt('New code');
   if (code) await post(`/api/pets/${id}/code`, {code});
@@ -1305,10 +1327,12 @@ $('liveOn').onclick = (e) => { clearLiveCanvas(); post(`/api/pets/${selectedPet(
 $('liveOff').onclick = (e) => { clearLiveCanvas(); post(`/api/pets/${selectedPet().id}/live`, {enabled: false}, e.target); };
 $('stayOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled: true, duration_seconds: Number($('stayDuration').value || 0) || null}, e.target);
 $('stayOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled: false}, e.target);
-$('clickMin').onchange = () => normalizeClickInputs('min');
-$('clickMax').onchange = () => normalizeClickInputs('max');
-$('randomOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/random-click`, {enabled: true, ...currentClickRange()}, e.target);
-$('randomOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/random-click`, {enabled: false, ...currentClickRange()}, e.target);
+$('clickMin').oninput = () => markClickRangeDirty('min');
+$('clickMax').oninput = () => markClickRangeDirty('max');
+$('clickMin').onchange = () => markClickRangeDirty('min');
+$('clickMax').onchange = () => markClickRangeDirty('max');
+$('randomOn').onclick = (e) => saveRandomClick(true, e.target);
+$('randomOff').onclick = (e) => saveRandomClick(false, e.target);
 $('copyLink').onclick = async () => { showToast(await copyTextFromInput($('petLink')) ? 'Copied' : 'Copy failed'); };
 $('logout').onclick = async () => { await fetch('/api/logout', {method: 'POST'}); location.href = '/'; };
 
