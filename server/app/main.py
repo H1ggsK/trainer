@@ -1556,6 +1556,8 @@ let selectedPetId = null;
 let liveFramePetId = null;
 let clickRangeDirty = false;
 let clickRangePetId = null;
+let settingsDirtyPetId = null;
+const settingsDirty = new Set();
 
 function showToast(text) {
   $('toast').textContent = text;
@@ -1617,6 +1619,34 @@ function currentClickRange() {
   return normalizeClickInputs(document.activeElement === $('clickMax') ? 'max' : 'min');
 }
 
+function ensureSettingsPet(petId) {
+  if (settingsDirtyPetId !== petId) {
+    settingsDirtyPetId = petId;
+    settingsDirty.clear();
+  }
+}
+
+function markSettingDirty(key) {
+  const pet = selectedPet();
+  if (!pet) return;
+  ensureSettingsPet(pet.id);
+  settingsDirty.add(key);
+}
+
+function clearSettingDirty(...keys) {
+  for (const key of keys) settingsDirty.delete(key);
+}
+
+function syncSettingInput(id, value, key, petId) {
+  ensureSettingsPet(petId);
+  if (!settingsDirty.has(key)) $(id).value = value;
+}
+
+function syncSettingCheckbox(id, value, key, petId) {
+  ensureSettingsPet(petId);
+  if (!settingsDirty.has(key)) $(id).checked = Boolean(value);
+}
+
 function clampSeconds(value, fallback, min, max) {
   const parsed = Number(value);
   const seconds = Number.isFinite(parsed) ? parsed : fallback;
@@ -1647,6 +1677,32 @@ async function saveRandomClick(enabled, button) {
     clickRangeDirty = false;
     clickRangePetId = pet.id;
   }
+}
+
+async function saveBreaks(enabled, button) {
+  const result = await post(`/api/pets/${selectedPet().id}/breaks`, {
+    enabled,
+    interval_seconds: clampSeconds($('breakInterval').value, 1800, 60, 86400),
+    duration_seconds: clampSeconds($('breakDuration').value, 300, 30, 3600)
+  }, button);
+  if (result) clearSettingDirty('breakInterval', 'breakDuration');
+}
+
+async function saveBark(enabled, button) {
+  const minSeconds = clampSeconds($('barkMin').value, 30, 1, 6000);
+  let maxSeconds = clampSeconds($('barkMax').value, 300, 1, 6000);
+  if (minSeconds > maxSeconds) maxSeconds = minSeconds;
+  $('barkMin').value = minSeconds;
+  $('barkMax').value = maxSeconds;
+  const result = await post(`/api/pets/${selectedPet().id}/bark`, {
+    enabled,
+    min_seconds: minSeconds,
+    max_seconds: maxSeconds,
+    response_seconds: clampSeconds($('barkResponse').value, 5, 1, 60),
+    record_seconds: clampSeconds($('barkRecordSeconds').value, 10, 1, 60),
+    record_enabled: $('barkRecordEnabled').checked
+  }, button);
+  if (result) clearSettingDirty('barkMin', 'barkMax', 'barkResponse', 'barkRecordSeconds', 'barkRecordEnabled');
 }
 
 function clearLiveCanvas() {
@@ -1698,17 +1754,17 @@ function renderSelected() {
   $('randomState').textContent = pet.random_enabled ? `Enabled, ${pet.click_min_seconds}-${pet.click_max_seconds}s` : 'Disabled';
   syncClickRangeInputs(pet);
   $('kneelState').textContent = pet.kneel_enabled ? 'On' : 'Off';
-  $('breakInterval').value = pet.break_interval_seconds;
-  $('breakDuration').value = pet.break_duration_seconds;
+  syncSettingInput('breakInterval', pet.break_interval_seconds, 'breakInterval', pet.id);
+  syncSettingInput('breakDuration', pet.break_duration_seconds, 'breakDuration', pet.id);
   if (pet.break_overdue) $('breakState').textContent = 'Break overdue';
   else if (pet.break_until) $('breakState').textContent = `On break until ${new Date(pet.break_until * 1000).toLocaleTimeString()}`;
   else if (pet.break_due_at) $('breakState').textContent = `Next break around ${new Date(pet.break_due_at * 1000).toLocaleTimeString()}`;
   else $('breakState').textContent = pet.break_enabled ? 'Enabled' : 'Disabled';
-  $('barkMin').value = pet.bark_min_seconds;
-  $('barkMax').value = pet.bark_max_seconds;
-  $('barkResponse').value = pet.bark_response_seconds;
-  $('barkRecordSeconds').value = pet.bark_record_seconds;
-  $('barkRecordEnabled').checked = pet.bark_record_enabled;
+  syncSettingInput('barkMin', pet.bark_min_seconds, 'barkMin', pet.id);
+  syncSettingInput('barkMax', pet.bark_max_seconds, 'barkMax', pet.id);
+  syncSettingInput('barkResponse', pet.bark_response_seconds, 'barkResponse', pet.id);
+  syncSettingInput('barkRecordSeconds', pet.bark_record_seconds, 'barkRecordSeconds', pet.id);
+  syncSettingCheckbox('barkRecordEnabled', pet.bark_record_enabled, 'barkRecordEnabled', pet.id);
   $('barkState').textContent = pet.bark_enabled
     ? `Enabled, ${pet.bark_min_seconds}-${pet.bark_max_seconds}s, ${pet.bark_response_seconds}s response`
     : 'Disabled';
@@ -1777,7 +1833,7 @@ async function copyTextFromInput(input) {
   }
 }
 
-window.selectPet = (id) => { selectedPetId = id; clickRangeDirty = false; clickRangePetId = id; clearLiveCanvas(); render({state, logs}); };
+window.selectPet = (id) => { selectedPetId = id; clickRangeDirty = false; clickRangePetId = id; settingsDirtyPetId = id; settingsDirty.clear(); clearLiveCanvas(); render({state, logs}); };
 window.changeCode = async (id) => {
   const code = prompt('New code');
   if (code) await post(`/api/pets/${id}/code`, {code});
@@ -1793,16 +1849,10 @@ $('stayOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled
 $('stayOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/stay`, {enabled: false}, e.target);
 $('kneelOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/kneel`, {enabled: true}, e.target);
 $('kneelOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/kneel`, {enabled: false}, e.target);
-$('breakOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/breaks`, {
-  enabled: true,
-  interval_seconds: clampSeconds($('breakInterval').value, 1800, 60, 86400),
-  duration_seconds: clampSeconds($('breakDuration').value, 300, 30, 3600)
-}, e.target);
-$('breakOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/breaks`, {
-  enabled: false,
-  interval_seconds: clampSeconds($('breakInterval').value, 1800, 60, 86400),
-  duration_seconds: clampSeconds($('breakDuration').value, 300, 30, 3600)
-}, e.target);
+$('breakInterval').oninput = () => markSettingDirty('breakInterval');
+$('breakDuration').oninput = () => markSettingDirty('breakDuration');
+$('breakOn').onclick = (e) => saveBreaks(true, e.target);
+$('breakOff').onclick = (e) => saveBreaks(false, e.target);
 $('clickMin').oninput = () => markClickRangeDirty('min');
 $('clickMax').oninput = () => markClickRangeDirty('max');
 $('clickMin').onchange = () => markClickRangeDirty('min');
@@ -1810,22 +1860,12 @@ $('clickMax').onchange = () => markClickRangeDirty('max');
 $('randomOn').onclick = (e) => saveRandomClick(true, e.target);
 $('randomOff').onclick = (e) => saveRandomClick(false, e.target);
 $('manualSpeak').onclick = (e) => post(`/api/pets/${selectedPet().id}/speak`, {}, e.target);
-$('barkOn').onclick = (e) => post(`/api/pets/${selectedPet().id}/bark`, {
-  enabled: true,
-  min_seconds: clampSeconds($('barkMin').value, 30, 1, 6000),
-  max_seconds: clampSeconds($('barkMax').value, 300, 1, 6000),
-  response_seconds: clampSeconds($('barkResponse').value, 5, 1, 60),
-  record_seconds: clampSeconds($('barkRecordSeconds').value, 10, 1, 60),
-  record_enabled: $('barkRecordEnabled').checked
-}, e.target);
-$('barkOff').onclick = (e) => post(`/api/pets/${selectedPet().id}/bark`, {
-  enabled: false,
-  min_seconds: clampSeconds($('barkMin').value, 30, 1, 6000),
-  max_seconds: clampSeconds($('barkMax').value, 300, 1, 6000),
-  response_seconds: clampSeconds($('barkResponse').value, 5, 1, 60),
-  record_seconds: clampSeconds($('barkRecordSeconds').value, 10, 1, 60),
-  record_enabled: $('barkRecordEnabled').checked
-}, e.target);
+for (const id of ['barkMin', 'barkMax', 'barkResponse', 'barkRecordSeconds']) {
+  $(id).oninput = () => markSettingDirty(id);
+}
+$('barkRecordEnabled').onchange = () => markSettingDirty('barkRecordEnabled');
+$('barkOn').onclick = (e) => saveBark(true, e.target);
+$('barkOff').onclick = (e) => saveBark(false, e.target);
 $('copyLink').onclick = async () => { showToast(await copyTextFromInput($('petLink')) ? 'Copied' : 'Copy failed'); };
 $('logout').onclick = async () => { await fetch('/api/logout', {method: 'POST'}); location.href = '/'; };
 $('clearLogs').onclick = (e) => { if (confirm('Clear all event logs?')) post('/api/logs/clear', {}, e.target); };
@@ -1871,7 +1911,8 @@ PET_HTML = """
       <h1 id="petName">Training Client</h1>
       <button id="leavePet" class="secondary" type="button">Leave Session</button>
     </div>
-    <video id="video" class="camera" playsinline muted></video>
+    <video id="video" playsinline muted hidden></video>
+    <canvas id="previewCanvas" class="camera"></canvas>
     <div class="row">
       <span id="status" class="badge">Starting</span>
       <span id="stayWarning" class="stay-warning" hidden>Stay in frame</span>
@@ -1905,6 +1946,7 @@ const loginError = document.getElementById('loginError');
 const petName = document.getElementById('petName');
 const leavePet = document.getElementById('leavePet');
 const video = document.getElementById('video');
+const previewCanvas = document.getElementById('previewCanvas');
 const status = document.getElementById('status');
 const stayWarning = document.getElementById('stayWarning');
 const kneelWarning = document.getElementById('kneelWarning');
@@ -1933,6 +1975,7 @@ let audioAnalyser = null;
 let audioData = null;
 let audioNoiseBaseline = 0.02;
 let mediaRecorder = null;
+let lastFaceBoxes = [];
 let lastPresent = null;
 let lastParts = '';
 let lastSent = 0;
@@ -2095,11 +2138,18 @@ function currentNoiseLevel() {
 }
 
 function watchForBark(until) {
+  let warmupFrames = 8;
   const tick = () => {
     if (performance.now() > until || !ws || ws.readyState !== WebSocket.OPEN) return;
     const level = currentNoiseLevel();
-    audioNoiseBaseline = audioNoiseBaseline * 0.97 + level * 0.03;
-    if (level > Math.max(0.08, audioNoiseBaseline * 3.5)) {
+    if (warmupFrames > 0) {
+      warmupFrames -= 1;
+      audioNoiseBaseline = Math.max(0.003, audioNoiseBaseline * 0.8 + level * 0.2);
+      requestAnimationFrame(tick);
+      return;
+    }
+    audioNoiseBaseline = Math.max(0.003, audioNoiseBaseline * 0.94 + level * 0.06);
+    if (level > 0.025 || level > audioNoiseBaseline * 1.8) {
       ws.send(JSON.stringify({type: 'bark_noise', level}));
       return;
     }
@@ -2134,6 +2184,7 @@ function startBarkRecording(seconds) {
 
 async function handleSpeak(message) {
   speakText('Speak!');
+  if (audioContext?.state !== 'running') await audioContext.resume().catch(() => {});
   barkPendingUntil = performance.now() + Number(message.response_seconds || 5) * 1000;
   barkRecordSeconds = Number(message.record_seconds || 10);
   barkRecordEnabled = Boolean(message.record_enabled);
@@ -2330,20 +2381,95 @@ function detectKneeling(landmarks) {
   return bent.some(Boolean);
 }
 
+function faceBoxesFromLandmarks(landmarks) {
+  const indexes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+  const points = indexes.map((i) => landmarks[i]).filter(landmarkVisible);
+  if (!points.length) return [];
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  let minX = Math.min(...xs);
+  let maxX = Math.max(...xs);
+  let minY = Math.min(...ys);
+  let maxY = Math.max(...ys);
+  const width = Math.max(0.10, maxX - minX);
+  const height = Math.max(0.14, maxY - minY);
+  minX -= width * 0.8;
+  maxX += width * 0.8;
+  minY -= height * 1.1;
+  maxY += height * 0.9;
+  return [{
+    x: Math.max(0, minX),
+    y: Math.max(0, minY),
+    w: Math.min(1, maxX) - Math.max(0, minX),
+    h: Math.min(1, maxY) - Math.max(0, minY),
+  }];
+}
+
+function censorBoxes(ctx, width, height, boxes) {
+  const pixelCanvas = document.createElement('canvas');
+  const pixelCtx = pixelCanvas.getContext('2d');
+  for (const box of boxes) {
+    const x = Math.max(0, Math.floor(box.x * width));
+    const y = Math.max(0, Math.floor(box.y * height));
+    const w = Math.min(width - x, Math.ceil(box.w * width));
+    const h = Math.min(height - y, Math.ceil(box.h * height));
+    if (w <= 0 || h <= 0) continue;
+    pixelCanvas.width = 10;
+    pixelCanvas.height = 10;
+    pixelCtx.imageSmoothingEnabled = true;
+    pixelCtx.drawImage(ctx.canvas, x, y, w, h, 0, 0, 10, 10);
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(pixelCanvas, 0, 0, 10, 10, x, y, w, h);
+    ctx.fillStyle = 'rgba(0, 0, 0, .42)';
+    ctx.fillRect(x, y, w, h);
+    ctx.restore();
+  }
+}
+
+function drawCameraFrame(targetCanvas, width, height, censor) {
+  targetCanvas.width = width;
+  targetCanvas.height = height;
+  const ctx = targetCanvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, width, height);
+  if (censor) censorBoxes(ctx, width, height, lastFaceBoxes);
+  return ctx;
+}
+
 async function analyze(result) {
   if (!result.landmarks || !result.landmarks.length) {
     if (faceDetector) {
       try {
         const faces = await faceDetector.detect(video);
-        if (faces.length) return {present: true, confidence: 0.75, parts: ['head/profile'], kneeling: null};
+        if (faces.length) {
+          lastFaceBoxes = faces.map((face) => {
+            const box = face.boundingBox;
+            return {
+              x: (box.x ?? box.left ?? 0) / video.videoWidth,
+              y: (box.y ?? box.top ?? 0) / video.videoHeight,
+              w: box.width / video.videoWidth,
+              h: box.height / video.videoHeight,
+            };
+          });
+          return {present: true, confidence: 0.75, parts: ['head/profile'], kneeling: null};
+        }
       } catch (_) {}
     }
+    lastFaceBoxes = [];
     return {present: false, confidence: 0, parts: [], kneeling: null};
   }
   const landmarks = result.landmarks[0];
+  lastFaceBoxes = faceBoxesFromLandmarks(landmarks);
   const visibleCount = landmarks.filter((point) => (point.visibility ?? 1) > 0.35).length;
   const parts = classifyParts(landmarks);
   return {present: parts.length > 0 || visibleCount >= 2, confidence: Math.min(1, visibleCount / 12), parts, kneeling: detectKneeling(landmarks)};
+}
+
+function drawPreview() {
+  if (video.readyState < 2) return;
+  const width = video.videoWidth || 640;
+  const height = video.videoHeight || 360;
+  drawCameraFrame(previewCanvas, width, height, censorFaces.checked);
 }
 
 let absentCandidateAt = null;
@@ -2428,27 +2554,7 @@ async function maybeSendLiveFrame(now) {
   lastLiveAt = now;
   const width = 480;
   const height = Math.round(width * video.videoHeight / video.videoWidth) || 270;
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(video, 0, 0, width, height);
-  if (censorFaces.checked && faceDetector) {
-    try {
-      const faces = await faceDetector.detect(video);
-      for (const face of faces) {
-        const box = face.boundingBox;
-        const x = box.x * width / video.videoWidth;
-        const y = box.y * height / video.videoHeight;
-        const w = box.width * width / video.videoWidth;
-        const h = box.height * height / video.videoHeight;
-        ctx.filter = 'blur(18px)';
-        ctx.drawImage(canvas, x, y, w, h, x, y, w, h);
-        ctx.filter = 'none';
-        ctx.fillStyle = 'rgba(0,0,0,.18)';
-        ctx.fillRect(x, y, w, h);
-      }
-    } catch (_) {}
-  }
+  drawCameraFrame(canvas, width, height, censorFaces.checked);
   ws.send(JSON.stringify({type: 'live_frame', frame: canvas.toDataURL('image/jpeg', 0.55)}));
 }
 
@@ -2457,8 +2563,11 @@ async function loop() {
     const result = poseLandmarker.detectForVideo(video, performance.now());
     const analyzed = await analyze(result);
     await sendPresence(analyzed.present, analyzed.confidence, analyzed.parts, analyzed.kneeling);
+    drawPreview();
     setStep('stepDetect', 'done');
     loadSteps.hidden = true;
+  } else {
+    drawPreview();
   }
   requestAnimationFrame(loop);
 }
